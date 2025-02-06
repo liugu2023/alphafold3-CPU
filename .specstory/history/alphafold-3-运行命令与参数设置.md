@@ -477,6 +477,28 @@ python run_alphafold.py \
 
 ---
 
+_**User**_
+
+I0206 17:54:45.839266 140105580143296 xla_bridge.py:895] Unable to initialize backend 'rocm': module 'jaxlib.xla_extension' has no attribute 'GpuAllocatorConfig'
+I0206 17:54:45.840124 140105580143296 xla_bridge.py:895] Unable to initialize backend 'tpu': INTERNAL: Failed to open libtpu.so: libtpu.so: cannot open shared object file: No such file or directory
+Using CPU device: TFRT_CPU_0
+Building model from scratch...
+Checking we can load the model parameters...
+Traceback (most recent call last):
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 711, in <module>
+    app.run(main)
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/absl/app.py", line 308, in run
+    _run_main(main, args)
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/absl/app.py", line 254, in _run_main
+    sys.exit(main(argv))
+             ^^^^^^^^^^
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 698, in main
+    data_pipeline_config=data_pipeline_config,
+                         ^^^^^^^^^^^^^^^^^^^^
+NameError: name 'data_pipeline_config' is not defined
+
+---
+
 
 
 ---

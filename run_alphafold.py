@@ -688,6 +688,40 @@ def main(_):
   else:
     model_runner = None
 
+  # 添加数据管道配置
+  if _RUN_DATA_PIPELINE.value:
+    data_pipeline_config = pipeline.DataPipelineConfig(
+        jackhmmer_binary_path=_JACKHMMER_BINARY_PATH.value,
+        nhmmer_binary_path=_NHMMER_BINARY_PATH.value,
+        hmmalign_binary_path=_HMMALIGN_BINARY_PATH.value,
+        hmmsearch_binary_path=_HMMSEARCH_BINARY_PATH.value,
+        hmmbuild_binary_path=_HMMBUILD_BINARY_PATH.value,
+        jackhmmer_n_cpu=_JACKHMMER_N_CPU.value,
+        nhmmer_n_cpu=_NHMMER_N_CPU.value,
+        small_bfd_database_path=replace_db_dir(
+            _SMALL_BFD_DATABASE_PATH.value, DB_DIR.value),
+        mgnify_database_path=replace_db_dir(
+            _MGNIFY_DATABASE_PATH.value, DB_DIR.value),
+        uniprot_cluster_annot_database_path=replace_db_dir(
+            _UNIPROT_CLUSTER_ANNOT_DATABASE_PATH.value, DB_DIR.value),
+        uniref90_database_path=replace_db_dir(
+            _UNIREF90_DATABASE_PATH.value, DB_DIR.value),
+        ntrna_database_path=replace_db_dir(
+            _NTRNA_DATABASE_PATH.value, DB_DIR.value),
+        rfam_database_path=replace_db_dir(
+            _RFAM_DATABASE_PATH.value, DB_DIR.value),
+        rna_central_database_path=replace_db_dir(
+            _RNA_CENTRAL_DATABASE_PATH.value, DB_DIR.value),
+        pdb_database_path=replace_db_dir(
+            _PDB_DATABASE_PATH.value, DB_DIR.value),
+        seqres_database_path=replace_db_dir(
+            _SEQRES_DATABASE_PATH.value, DB_DIR.value),
+        max_template_date=datetime.datetime.strptime(
+            _MAX_TEMPLATE_DATE.value, '%Y-%m-%d'),
+    )
+  else:
+    data_pipeline_config = None
+
   num_fold_inputs = 0
   for fold_input in fold_inputs:
     if _NUM_SEEDS.value is not None:
