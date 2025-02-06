@@ -416,36 +416,69 @@ def predict_structure(
     print(f'Running model inference with seed {seed}...')
     inference_start_time = time.time()
     rng_key = jax.random.PRNGKey(seed)
-    result = model_runner.run_inference(example, rng_key)
-    print(
-        f'Running model inference with seed {seed} took'
-        f' {time.time() - inference_start_time:.2f} seconds.'
-    )
-    print(f'Extracting output structure samples with seed {seed}...')
-    extract_structures = time.time()
-    inference_results = model_runner.extract_structures(
-        batch=example, result=result, target_name=fold_input.name
-    )
-    print(
-        f'Extracting {len(inference_results)} output structure samples with'
-        f' seed {seed} took {time.time() - extract_structures:.2f} seconds.'
-    )
-
-    embeddings = model_runner.extract_embeddings(result)
-
-    all_inference_results.append(
-        ResultsForSeed(
-            seed=seed,
-            inference_results=inference_results,
-            full_fold_input=fold_input,
-            embeddings=embeddings,
+    
+    # 添加错误处理和数值检查
+    try:
+        result = model_runner.run_inference(example, rng_key)
+        
+        # 检查结果中是否包含 NaN/inf 值
+        def check_array(arr, name):
+            if isinstance(arr, (np.ndarray, jnp.ndarray)):
+                if np.any(np.isnan(arr)) or np.any(np.isinf(arr)):
+                    print(f'Warning: {name} contains NaN/inf values')
+                    # 替换 NaN/inf 值为 0
+                    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+            return arr
+        
+        # 递归检查并清理结果字典
+        def clean_result(d):
+            if isinstance(d, dict):
+                return {k: clean_result(v) for k, v in d.items()}
+            elif isinstance(d, (list, tuple)):
+                return type(d)(clean_result(x) for x in d)
+            else:
+                return check_array(d, 'array')
+        
+        result = clean_result(result)
+        
+        print(
+            f'Running model inference with seed {seed} took'
+            f' {time.time() - inference_start_time:.2f} seconds.'
         )
-    )
+        print(f'Extracting output structure samples with seed {seed}...')
+        extract_structures = time.time()
+        inference_results = model_runner.extract_structures(
+            batch=example, result=result, target_name=fold_input.name
+        )
+        print(
+            f'Extracting {len(inference_results)} output structure samples with'
+            f' seed {seed} took {time.time() - extract_structures:.2f} seconds.'
+        )
+
+        embeddings = model_runner.extract_embeddings(result)
+
+        all_inference_results.append(
+            ResultsForSeed(
+                seed=seed,
+                inference_results=inference_results,
+                full_fold_input=fold_input,
+                embeddings=embeddings,
+            )
+        )
+    except Exception as e:
+        print(f'Error processing seed {seed}: {str(e)}')
+        print('Skipping this seed and continuing with the next one...')
+        continue
+        
   print(
       'Running model inference and extracting output structures with'
       f' {len(fold_input.rng_seeds)} seed(s) took'
       f' {time.time() - all_inference_start_time:.2f} seconds.'
   )
+  
+  if not all_inference_results:
+    raise ValueError('No valid predictions were generated for any seed.')
+    
   return all_inference_results
 
 
