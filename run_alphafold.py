@@ -272,17 +272,21 @@ _SAVE_EMBEDDINGS = flags.DEFINE_bool(
 
 def make_model_config(
     *,
-    flash_attention_implementation: attention.Implementation = 'xla',  # 改为 xla 实现
+    flash_attention_implementation: attention.Implementation = 'xla',
     num_diffusion_samples: int = 5,
     num_recycles: int = 10,
     return_embeddings: bool = False,
 ) -> model.Model.Config:
     """返回模型配置，针对 CPU 优化"""
     config = model.Model.Config()
-    config.global_config.flash_attention_implementation = 'xla'  # CPU 只能用 xla
+    config.global_config.flash_attention_implementation = 'xla'  # CPU 优化
     config.heads.diffusion.eval.num_samples = num_diffusion_samples
     config.num_recycles = num_recycles
     config.return_embeddings = return_embeddings
+    
+    # 添加一些优化配置
+    config.global_config.deterministic = False  # 允许非确定性优化
+    config.global_config.subbatch_size = 4  # 添加子批次处理
     return config
 
 
@@ -665,6 +669,11 @@ def process_fold_input(
 
 
 def main(_):
+  # 添加 JAX 优化配置
+  jax.config.update('jax_enable_x64', False)  # 使用 float32 而不是 float64
+  jax.config.update('jax_disable_jit', False)  # 确保启用 JIT
+  jax.config.update('jax_platform_name', 'cpu')  # 明确使用 CPU
+  
   if _JAX_COMPILATION_CACHE_DIR.value is not None:
     jax.config.update(
         'jax_compilation_cache_dir', _JAX_COMPILATION_CACHE_DIR.value

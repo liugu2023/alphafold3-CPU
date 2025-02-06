@@ -1006,6 +1006,188 @@ _**Assistant**_
 
 
 
+我将修改脚本，添加一个提取和显示耗时最长的五个步骤的功能：
+
+```bash:run_alphafold_with_time.sh
+#!/bin/bash
+
+# 设置运行时间日志文件
+TIME_LOG="/archive/liugu/output/time_log_$(date +%Y%m%d_%H%M%S).txt"
+FULL_LOG="/archive/liugu/output/alphafold_$(date +%Y%m%d_%H%M%S).log"
+
+# 记录开始时间
+echo "=== AlphaFold Run Time Log ===" > $TIME_LOG
+echo "Start time: $(date)" >> $TIME_LOG
+START_TIME=$(date +%s)
+
+# 运行 AlphaFold 并同时记录输出
+python run_alphafold.py \
+  --json_path=/archive/liugu/input/process/37aa_2JO9.json \
+  --output_dir=/archive/liugu/output \
+  --model_dir=/archive/liugu/model \
+  --db_dir=/archive/plato/task3/database \
+  --num_recycles=10 \
+  --num_diffusion_samples=5 \
+  --jackhmmer_n_cpu=30 \
+  --nhmmer_n_cpu=30 \
+  2>&1 | tee $FULL_LOG
+
+# 记录结束时间和总运行时间
+END_TIME=$(date +%s)
+DURATION=$((END_TIME - START_TIME))
+
+# 转换总时间为更易读的格式
+HOURS=$((DURATION / 3600))
+MINUTES=$(( (DURATION % 3600) / 60 ))
+SECONDS=$((DURATION % 60))
+
+# 写入时间信息
+echo "End time: $(date)" >> $TIME_LOG
+echo "Total runtime: ${HOURS}h ${MINUTES}m ${SECONDS}s" >> $TIME_LOG
+echo "Total seconds: ${DURATION}" >> $TIME_LOG
+
+# 从完整日志中提取关键时间信息
+echo -e "\nDetailed timing breakdown:" >> $TIME_LOG
+grep "took.*seconds" $FULL_LOG >> $TIME_LOG
+
+# 提取并排序耗时最长的5个步骤
+echo -e "\nTop 5 most time-consuming steps:" >> $TIME_LOG
+grep "took.*seconds" $FULL_LOG | 
+  sed 's/.*\([0-9]\+\.[0-9]\+\) seconds.*/\1 &/' |  # 将秒数移到行首以便排序
+  sort -rn |  # 按数字降序排序
+  head -n 5 |  # 取前5行
+  sed 's/^[0-9.]\+ //' >> $TIME_LOG  # 删除行首的秒数
+
+# 打印时间信息到屏幕
+echo "----------------------------------------"
+echo "Run completed!"
+echo "Total runtime: ${HOURS}h ${MINUTES}m ${SECONDS}s"
+echo -e "\nTop 5 most time-consuming steps:"
+grep "took.*seconds" $FULL_LOG | 
+  sed 's/.*\([0-9]\+\.[0-9]\+\) seconds.*/\1 &/' |
+  sort -rn |
+  head -n 5 |
+  sed 's/^[0-9.]\+ //' |
+  while IFS= read -r line; do
+    echo "  $line"
+  done
+echo -e "\nDetailed timing information saved to: $TIME_LOG"
+echo "Full log saved to: $FULL_LOG"
+echo "----------------------------------------"
+```
+
+主要改动：
+1. 添加了提取耗时最长的5个步骤的功能
+2. 将这些信息同时写入日志文件和显示在屏幕上
+3. 使用了更好的格式化输出
+
+新增的输出示例：
+```
+----------------------------------------
+Run completed!
+Total runtime: 1h 15m 30s
+
+Top 5 most time-consuming steps:
+  Running model inference with seed 1 took 3890.67 seconds
+  Extracting 5 output structure samples with seed 1 took 518.88 seconds
+  Featurising data with 1 seed(s) took 120.45 seconds
+  Processing chain A took 45.23 seconds
+  Running data pipeline took 35.67 seconds
+
+Detailed timing information saved to: /archive/liugu/output/time_log_20240206_183000.txt
+Full log saved to: /archive/liugu/output/alphafold_20240206_183000.log
+----------------------------------------
+```
+
+时间日志文件中也会包含这些信息：
+```
+=== AlphaFold Run Time Log ===
+Start time: Tue Feb 6 18:30:00 CST 2024
+End time: Tue Feb 6 19:45:30 CST 2024
+Total runtime: 1h 15m 30s
+Total seconds: 4530
+
+Detailed timing breakdown:
+... (所有耗时信息)
+
+Top 5 most time-consuming steps:
+Running model inference with seed 1 took 3890.67 seconds
+Extracting 5 output structure samples with seed 1 took 518.88 seconds
+Featurising data with 1 seed(s) took 120.45 seconds
+Processing chain A took 45.23 seconds
+Running data pipeline took 35.67 seconds
+```
+
+使用方法保持不变：
+```bash
+chmod +x run_alphafold_with_time.sh
+./run_alphafold_with_time.sh
+```
+
+这样可以更清晰地看到哪些步骤最耗时，有助于性能分析和优化。
+
+---
+
+_**User**_
+
+=== AlphaFold Run Time Log ===
+Start time: Thu Feb  6 08:17:01 PM CST 2025
+End time: Thu Feb  6 08:45:47 PM CST 2025
+Total runtime: 0h 28m 46s
+Total seconds: 1726
+
+Detailed timing breakdown:
+Processing chain A took 0.00 seconds
+Featurising data with seed 1 took 0.63 seconds.
+Featurising data with 1 seed(s) took 5.81 seconds.
+Running model inference with seed 1 took 1714.59 seconds.
+Extracting 5 output structure samples with seed 1 took 0.16 seconds.
+Running model inference and extracting output structures with 1 seed(s) took 1714.75 seconds.
+
+Top 5 most time-consuming steps:
+Featurising data with 1 seed(s) took 5.81 seconds.
+Running model inference and extracting output structures with 1 seed(s) took 1714.75 seconds.
+Running model inference with seed 1 took 1714.59 seconds.
+Featurising data with seed 1 took 0.63 seconds.
+Extracting 5 output structure samples with seed 1 took 0.16 seconds.
+
+---
+
+_**Assistant**_
+
+我看到运行结果显示总共花费了28分46秒，其中最耗时的步骤是模型推理，占用了大约28分35秒(1714.59秒)。让我帮您分析一下时间分布：
+
+主要耗时步骤（按耗时排序）：
+1. 模型推理 (Running model inference): 1714.59秒 (~28.5分钟)
+   - 这是最耗时的步骤，占总时间的99%以上
+   - 这是在CPU上运行的结果，如果有GPU可用的话可以大大加快这个步骤
+
+2. 特征提取 (Featurising data): 5.81秒
+   - 相对较快，主要包含数据预处理和特征计算
+
+3. 其他步骤都很快：
+   - 结构提取 (Extracting structures): 0.16秒
+   - 链处理 (Processing chain): 0.00秒
+
+优化建议：
+1. 如果可能的话，考虑使用GPU来加速模型推理
+2. 可以尝试减少recycles次数（当前设置为10）来缩短推理时间
+3. 如果需要处理多个输入，可以考虑并行处理
+
+需要我帮您修改任何参数来优化运行时间吗？
+
+---
+
+_**User**_
+
+那么咱们主要的优化方向就是模型推理了
+
+---
+
+_**Assistant**_
+
+
+
 ---
 
 
