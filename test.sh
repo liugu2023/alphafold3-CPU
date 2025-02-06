@@ -11,7 +11,7 @@ START_TIME=$(date +%s)
 
 # 运行 AlphaFold 并同时记录输出
 python run_alphafold.py \
-  --json_path=/archive/liugu/input/process/37aa_2JO9.json \
+  --json_path=/archive/liugu/input/processed/37aa_2JO9.json \
   --output_dir=/archive/liugu/output \
   --model_dir=/archive/liugu/model \
   --db_dir=/archive/plato/task3/database \
