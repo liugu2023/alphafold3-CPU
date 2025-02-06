@@ -1186,6 +1186,147 @@ _**User**_
 
 _**Assistant**_
 
+是的，从运行结果来看，模型推理占用了99%以上的时间。让我们尝试优化模型推理部分。
+
+以下是几个可能的优化方向：
+
+1. 调整 `run_alphafold.py` 中的推理参数：
+
+```python:run_alphafold.py
+def make_model_config(
+    *,
+    flash_attention_implementation: attention.Implementation = 'xla',
+    num_diffusion_samples: int = 5,
+    num_recycles: int = 10,  # 可以考虑减少这个值
+    return_embeddings: bool = False,
+) -> model.Model.Config:
+    """返回模型配置，针对 CPU 优化"""
+    config = model.Model.Config()
+    config.global_config.flash_attention_implementation = 'xla'  # CPU 优化
+    config.heads.diffusion.eval.num_samples = num_diffusion_samples
+    config.num_recycles = num_recycles
+    config.return_embeddings = return_embeddings
+    
+    # 添加一些优化配置
+    config.global_config.deterministic = False  # 允许非确定性优化
+    config.global_config.subbatch_size = 4  # 添加子批次处理
+    return config
+```
+
+2. 创建一个新的测试脚本来比较不同参数的性能：
+
+```bash:test_performance.sh
+#!/bin/bash
+
+# 基准目录
+BASE_DIR="/archive/liugu/output/performance_test_$(date +%Y%m%d_%H%M%S)"
+mkdir -p $BASE_DIR
+
+# 测试不同的 recycles 次数
+for recycles in 3 5 8 10; do
+    echo "Testing with num_recycles = $recycles"
+    
+    OUTPUT_DIR="$BASE_DIR/recycles_${recycles}"
+    TIME_LOG="$OUTPUT_DIR/time_log.txt"
+    
+    python run_alphafold.py \
+      --json_path=/archive/liugu/input/process/37aa_2JO9.json \
+      --output_dir=$OUTPUT_DIR \
+      --model_dir=/archive/liugu/model \
+      --db_dir=/archive/plato/task3/database \
+      --num_recycles=$recycles \
+      --num_diffusion_samples=5 \
+      --jackhmmer_n_cpu=30 \
+      --nhmmer_n_cpu=30 \
+      2>&1 | tee "$OUTPUT_DIR/full_log.txt"
+      
+    # 提取推理时间
+    INFERENCE_TIME=$(grep "Running model inference with seed 1 took" "$OUTPUT_DIR/full_log.txt" | awk '{print $8}')
+    echo "num_recycles=$recycles: $INFERENCE_TIME seconds" >> "$BASE_DIR/comparison.txt"
+done
+
+# 打印比较结果
+echo "Performance comparison:"
+cat "$BASE_DIR/comparison.txt"
+```
+
+3. 在 `run_alphafold.py` 中添加 JAX 优化配置：
+
+```python:run_alphafold.py
+def main(_):
+    # 添加 JAX 优化配置
+    jax.config.update('jax_enable_x64', False)  # 使用 float32 而不是 float64
+    jax.config.update('jax_disable_jit', False)  # 确保启用 JIT
+    jax.config.update('jax_platform_name', 'cpu')  # 明确使用 CPU
+    
+    if _JAX_COMPILATION_CACHE_DIR.value is not None:
+        jax.config.update(
+            'jax_compilation_cache_dir', _JAX_COMPILATION_CACHE_DIR.value
+        )
+    
+    # ... rest of the code ...
+```
+
+建议的优化步骤：
+
+1. 首先运行性能测试脚本，找到最佳的 `num_recycles` 值：
+```bash
+chmod +x test_performance.sh
+./test_performance.sh
+```
+
+2. 根据测试结果，修改默认配置：
+```bash
+python run_alphafold.py \
+  --json_path=/archive/liugu/input/process/37aa_2JO9.json \
+  --output_dir=/archive/liugu/output \
+  --model_dir=/archive/liugu/model \
+  --db_dir=/archive/plato/task3/database \
+  --num_recycles=5 \  # 使用测试找到的最佳值
+  --num_diffusion_samples=5 \
+  --jackhmmer_n_cpu=30 \
+  --nhmmer_n_cpu=30
+```
+
+这些优化主要针对：
+1. 减少循环次数以缩短推理时间
+2. 使用 JAX 优化来提高 CPU 性能
+3. 通过子批次处理来优化内存使用
+4. 使用 float32 而不是 float64 来加速计算
+
+您想先尝试哪个优化方向？我们可以逐步测试并比较效果。
+
+---
+
+_**User**_
+
+Testing with num_recycles = 10
+tee: /archive/liugu/output/performance_test_20250206_205627/recycles_10/full_log.txt: No such file or directory
+I0206 20:56:38.800024 140617173410496 xla_bridge.py:895] Unable to initialize backend 'rocm': module 'jaxlib.xla_extension' has no attribute 'GpuAllocatorConfig'
+I0206 20:56:38.801026 140617173410496 xla_bridge.py:895] Unable to initialize backend 'tpu': INTERNAL: Failed to open libtpu.so: libtpu.so: cannot open shared object file: No such file or directory
+Using CPU device: TFRT_CPU_0
+Building model from scratch...
+Checking we can load the model parameters...
+Traceback (most recent call last):
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 787, in <module>
+    app.run(main)
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/absl/app.py", line 308, in run
+    _run_main(main, args)
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/absl/app.py", line 254, in _run_main
+    sys.exit(main(argv))
+             ^^^^^^^^^^
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 768, in main
+    for fold_input in fold_inputs:
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/alphafold3/common/folding_input.py", line 1353, in load_fold_inputs_from_path
+    with open(json_path, 'r') as f:
+         ^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: '/archive/liugu/input/process/37aa_2JO9.json'
+grep: /archive/liugu/output/performance_test_20250206_205627/recycles_10/full_log.txt: No such file or directory
+
+---
+
+_**Assistant**_
+
 
 
 ---
