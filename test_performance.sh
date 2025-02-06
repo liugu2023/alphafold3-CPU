@@ -12,7 +12,7 @@ for recycles in 3 5 8 10; do
     TIME_LOG="$OUTPUT_DIR/time_log.txt"
     
     python run_alphafold.py \
-      --json_path=/archive/liugu/input/process/37aa_2JO9.json \
+      --json_path=/archive/liugu/input/processed/37aa_2JO9.json \
       --output_dir=$OUTPUT_DIR \
       --model_dir=/archive/liugu/model \
       --db_dir=/archive/plato/task3/database \
