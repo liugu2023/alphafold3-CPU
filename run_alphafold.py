@@ -331,16 +331,7 @@ class ModelRunner:
         self, featurised_example: features.BatchDict, rng_key: jnp.ndarray
     ) -> model.ModelResult:
         """Computes a forward pass of the model on a featurised example."""
-        # 添加输入检查
-        def validate_input(x):
-            if isinstance(x, (np.ndarray, jnp.ndarray)):
-                if np.any(np.isnan(x)) or np.any(np.isinf(x)):
-                    print(f"Warning: Input contains NaN/inf in array of shape {x.shape}")
-                    x = np.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
-            return x
-        
-        featurised_example = jax.tree_map(validate_input, featurised_example)
-        
+        # 输入预处理
         featurised_example = jax.device_put(
             jax.tree_util.tree_map(
                 jnp.asarray, utils.remove_invalidly_typed_feats(featurised_example)
@@ -348,25 +339,29 @@ class ModelRunner:
             self._device,
         )
 
+        # 运行模型
         result = self._model(rng_key, featurised_example)
         
-        # 添加中间结果检查
-        def check_intermediate(x):
-            if isinstance(x, (np.ndarray, jnp.ndarray)):
-                if np.any(np.isnan(x)):
-                    raise ValueError(f"NaN detected in array of shape {x.shape}")
-                if np.any(np.isinf(x)):
-                    raise ValueError(f"Inf detected in array of shape {x.shape}")
-            return x
-            
-        result = jax.tree_map(check_intermediate, result)
-        result = jax.tree.map(
+        # 后处理结果
+        result = jax.tree_util.tree_map(np.asarray, result)
+        result = jax.tree_util.tree_map(
             lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x,
             result,
         )
+        
+        # 只在debug时检查数值
+        if os.environ.get('AF_DEBUG'):
+            def check_values(x):
+                if isinstance(x, (np.ndarray, jnp.ndarray)) and x.dtype.kind in 'fc':
+                    if np.any(np.isnan(x)):
+                        print(f"Warning: NaN detected in array of shape {x.shape}")
+                    if np.any(np.isinf(x)):
+                        print(f"Warning: Inf detected in array of shape {x.shape}")
+                return x
+            result = jax.tree_util.tree_map(check_values, result)
+        
         result = dict(result)
-        identifier = self.model_params['__meta__']['__identifier__'].tobytes()
-        result['__identifier__'] = identifier
+        result['__identifier__'] = self.model_params['__meta__']['__identifier__'].tobytes()
         return result
 
     def _preprocess_features(self, features):
@@ -444,25 +439,12 @@ def predict_structure(
     # 特征化处理
     featurised_examples = []
     def validate_features(example):
-        """验证特征的有效性"""
-        def check_numeric_array(value, key):
-            if isinstance(value, (np.ndarray, jnp.ndarray)):
-                if value.dtype.kind in 'fc':  # 只检查浮点数和复数类型
-                    if np.any(np.isnan(value)):
-                        print(f"Warning: NaN in feature {key} of shape {value.shape}")
-                    if np.any(np.isinf(value)):
-                        print(f"Warning: Inf in feature {key} of shape {value.shape}")
-        
-        if isinstance(example, list):
-            # 如果是列表，验证每个元素
-            for item in example:
-                if isinstance(item, dict):
-                    for key, value in item.items():
-                        check_numeric_array(value, key)
-        elif isinstance(example, dict):
-            # 如果是字典，直接验证
+        """基本的特征验证"""
+        if isinstance(example, dict):
             for key, value in example.items():
-                check_numeric_array(value, key)
+                if isinstance(value, (np.ndarray, jnp.ndarray)):
+                    if value.dtype.kind in 'fc' and (np.any(np.isnan(value)) or np.any(np.isinf(value))):
+                        print(f"Warning: Invalid values in feature {key}")
         return example
     
     for seed in fold_input.rng_seeds:
@@ -761,23 +743,23 @@ def make_model_config(
     num_recycles: int = 10,
     return_embeddings: bool = False,
 ) -> model.Model.Config:
-    """返回模型配置，针对 CPU 优化"""
+    """返回模型配置"""
     config = model.Model.Config()
     
-    # 修改数值计算配置
+    # 基础配置
+    config.heads.diffusion.eval.num_samples = num_diffusion_samples
+    config.num_recycles = num_recycles
+    config.return_embeddings = return_embeddings
+    config.global_config.flash_attention_implementation = flash_attention_implementation
+    
+    # CPU 特定优化
     config.global_config.precision = jnp.float32
     config.global_config.deterministic = True
-    config.global_config.subbatch_size = 4  # 减小批次大小以提高稳定性
+    config.global_config.subbatch_size = 8  # 保持较大的批次大小
     
     # 数值稳定性配置
-    config.global_config.eps = 1e-6
-    config.global_config.inf_value = 1e6
-    config.global_config.nan_guard = True
-    config.global_config.softmax_scale = 0.5  # 降低 softmax 温度
-    
-    # 注意力机制配置
-    config.global_config.attention_clip = True
-    config.global_config.attention_max = 10.0
+    config.global_config.eps = 1e-7  # 使用标准epsilon值
+    config.global_config.softmax_scale = 1.0  # 使用默认softmax温度
     
     return config
 
