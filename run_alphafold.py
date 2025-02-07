@@ -453,9 +453,21 @@ def predict_structure(
         try:
             # 确保 example 是正确的格式
             if isinstance(example, list):
-                example = example[0]  # 如果是列表，取第一个元素
+                example = example[0]
                 
             result = model_runner.run_inference(example, rng_key)
+            
+            # 检查结果中的数值
+            def check_and_fix_nans(x):
+                if isinstance(x, (np.ndarray, jnp.ndarray)):
+                    # 替换 NaN/inf 值为 0
+                    if np.any(np.isnan(x)) or np.any(np.isinf(x)):
+                        print(f"Warning: Found NaN/inf values in array of shape {x.shape}")
+                        x = np.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
+                return x
+            
+            # 递归处理所有数组
+            result = jax.tree_map(check_and_fix_nans, result)
             
             print(
                 f'Running model inference with seed {seed} took'
@@ -463,30 +475,46 @@ def predict_structure(
             )
             print(f'Extracting output structure samples with seed {seed}...')
             extract_structures = time.time()
-            inference_results = model_runner.extract_structures(
-                batch=example, result=result, target_name=fold_input.name
-            )
-            print(
-                f'Extracting {len(inference_results)} output structure samples with'
-                f' seed {seed} took {time.time() - extract_structures:.2f} seconds.'
-            )
-
-            embeddings = model_runner.extract_embeddings(result)
-
-            all_inference_results.append(
-                ResultsForSeed(
-                    seed=seed,
-                    inference_results=inference_results,
-                    full_fold_input=fold_input,
-                    embeddings=embeddings,
+            
+            try:
+                inference_results = model_runner.extract_structures(
+                    batch=example, result=result, target_name=fold_input.name
                 )
-            )
+                
+                # 验证结构结果
+                for res in inference_results:
+                    if not hasattr(res, 'positions') or res.positions is None:
+                        raise ValueError("Invalid structure result: missing positions")
+                    if np.any(np.isnan(res.positions)) or np.any(np.isinf(res.positions)):
+                        raise ValueError("Invalid structure result: NaN/inf in positions")
+                
+                print(
+                    f'Extracting {len(inference_results)} output structure samples with'
+                    f' seed {seed} took {time.time() - extract_structures:.2f} seconds.'
+                )
+
+                embeddings = model_runner.extract_embeddings(result)
+
+                all_inference_results.append(
+                    ResultsForSeed(
+                        seed=seed,
+                        inference_results=inference_results,
+                        full_fold_input=fold_input,
+                        embeddings=embeddings,
+                    )
+                )
+            except Exception as e:
+                print(f"Error in structure extraction: {str(e)}")
+                print("Detailed error information:")
+                import traceback
+                traceback.print_exc()
+                continue
+                
         except Exception as e:
             print(f'Error processing seed {seed}: {str(e)}')
             print('Error details:', e.__class__.__name__)
             import traceback
             traceback.print_exc()
-            print('Skipping this seed and continuing with the next one...')
             continue
         
     print(

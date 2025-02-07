@@ -1390,6 +1390,202 @@ def predict_structure(
 
 ---
 
+_**User**_
+
+Running fold job 37aa_2JO9...
+Output will be written in /archive/liugu/output/performance_test_20250207_152536/recycles_10/37aa_2jo9
+Running data pipeline...
+Processing chain A
+Processing chain A took 0.00 seconds
+Writing model input JSON to /archive/liugu/output/performance_test_20250207_152536/recycles_10/37aa_2jo9/37aa_2jo9_data.json
+Predicting 3D structure for 37aa_2JO9 with 1 seed(s)...
+Featurising data with 1 seed(s)...
+Featurising data with seed 1.
+Featurising data with seed 1 took 0.64 seconds.
+Featurising data with 1 seed(s) took 6.29 seconds.
+Running model inference and extracting output structure samples with 1 seed(s)...
+Running model inference with seed 1...
+Error processing seed 1: 'list' object has no attribute 'items'
+Skipping this seed and continuing with the next one...
+Running model inference and extracting output structures with 1 seed(s) took 0.04 seconds.
+Traceback (most recent call last):
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 820, in <module>
+    app.run(main)
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/absl/app.py", line 308, in run
+    _run_main(main, args)
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/absl/app.py", line 254, in _run_main
+    sys.exit(main(argv))
+             ^^^^^^^^^^
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 805, in main
+    process_fold_input(
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 657, in process_fold_input
+    all_inference_results = predict_structure(
+                            ^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 488, in predict_structure
+    raise ValueError('No valid predictions were generated for any seed.')
+ValueError: No valid predictions were generated for any seed.
+Warning: Could not extract inference time for num_recycles=10
+Completed test with num_recycles = 10
+
+---
+
+_**Assistant**_
+
+
+
+看起来问题出在处理 `featurised_examples` 的方式上。让我们修改 `predict_structure` 函数：
+
+```python:run_alphafold.py
+def predict_structure(
+    fold_input: folding_input.Input,
+    model_runner: ModelRunner,
+    buckets: Sequence[int] | None = None,
+    conformer_max_iterations: int | None = None,
+) -> Sequence[ResultsForSeed]:
+    """Runs the full inference pipeline to predict structures for each seed."""
+
+    print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
+    featurisation_start_time = time.time()
+    ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
+    
+    # 特征化处理
+    featurised_examples = []
+    for seed in fold_input.rng_seeds:
+        print(f'Featurising data with seed {seed}.')
+        example = featurisation.featurise_input(
+            fold_input=fold_input,
+            buckets=buckets,
+            ccd=ccd,
+            verbose=True,
+            conformer_max_iterations=conformer_max_iterations,
+        )
+        featurised_examples.append(example)
+    
+    print(
+        f'Featurising data with {len(fold_input.rng_seeds)} seed(s) took'
+        f' {time.time() - featurisation_start_time:.2f} seconds.'
+    )
+    print(
+        'Running model inference and extracting output structure samples with'
+        f' {len(fold_input.rng_seeds)} seed(s)...'
+    )
+    all_inference_start_time = time.time()
+    all_inference_results = []
+    
+    for seed, example in zip(fold_input.rng_seeds, featurised_examples):
+        print(f'Running model inference with seed {seed}...')
+        inference_start_time = time.time()
+        rng_key = jax.random.PRNGKey(seed)
+        
+        try:
+            # 确保 example 是正确的格式
+            if isinstance(example, list):
+                example = example[0]  # 如果是列表，取第一个元素
+                
+            result = model_runner.run_inference(example, rng_key)
+            
+            print(
+                f'Running model inference with seed {seed} took'
+                f' {time.time() - inference_start_time:.2f} seconds.'
+            )
+            print(f'Extracting output structure samples with seed {seed}...')
+            extract_structures = time.time()
+            inference_results = model_runner.extract_structures(
+                batch=example, result=result, target_name=fold_input.name
+            )
+            print(
+                f'Extracting {len(inference_results)} output structure samples with'
+                f' seed {seed} took {time.time() - extract_structures:.2f} seconds.'
+            )
+
+            embeddings = model_runner.extract_embeddings(result)
+
+            all_inference_results.append(
+                ResultsForSeed(
+                    seed=seed,
+                    inference_results=inference_results,
+                    full_fold_input=fold_input,
+                    embeddings=embeddings,
+                )
+            )
+        except Exception as e:
+            print(f'Error processing seed {seed}: {str(e)}')
+            print('Error details:', e.__class__.__name__)
+            import traceback
+            traceback.print_exc()
+            print('Skipping this seed and continuing with the next one...')
+            continue
+        
+    print(
+        'Running model inference and extracting output structures with'
+        f' {len(fold_input.rng_seeds)} seed(s) took'
+        f' {time.time() - all_inference_start_time:.2f} seconds.'
+    )
+    
+    if not all_inference_results:
+        raise ValueError('No valid predictions were generated for any seed.')
+    
+    return all_inference_results
+```
+
+主要修改：
+1. 为每个 seed 单独进行特征化处理
+2. 添加了更详细的错误处理和日志
+3. 确保 example 格式正确
+4. 添加了更多的调试信息
+
+让我们重新运行测试：
+```bash
+./test_performance.sh
+```
+
+这样应该能看到更详细的错误信息，帮助我们定位问题。需要我解释更多细节吗？
+
+---
+
+_**User**_
+
+Running fold job 37aa_2JO9...
+Output will be written in /archive/liugu/output/performance_test_20250207_152645/recycles_10/37aa_2jo9
+Running data pipeline...
+Processing chain A
+Processing chain A took 0.00 seconds
+Writing model input JSON to /archive/liugu/output/performance_test_20250207_152645/recycles_10/37aa_2jo9/37aa_2jo9_data.json
+Predicting 3D structure for 37aa_2JO9 with 1 seed(s)...
+Featurising data with 1 seed(s)...
+Featurising data with seed 1.
+Featurising data with seed 1.
+Featurising data with seed 1 took 0.61 seconds.
+Featurising data with 1 seed(s) took 4.89 seconds.
+Running model inference and extracting output structure samples with 1 seed(s)...
+Running model inference with seed 1...
+run_inference took 1798.16 seconds
+Running model inference with seed 1 took 1798.19 seconds.
+Extracting output structure samples with seed 1...
+Error processing seed 1: Column x must not contain NaN/inf values.
+Error details: ValueError
+Skipping this seed and continuing with the next one...
+Running model inference and extracting output structures with 1 seed(s) took 1798.23 seconds.
+Traceback (most recent call last):
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 831, in <module>
+    app.run(main)
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/absl/app.py", line 308, in run
+    _run_main(main, args)
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/absl/app.py", line 254, in _run_main
+    sys.exit(main(argv))
+             ^^^^^^^^^^
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 816, in main
+    process_fold_input(
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 668, in process_fold_input
+    all_inference_results = predict_structure(
+                            ^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 499, in predict_structure
+    raise ValueError('No valid predictions were generated for any seed.')
+ValueError: No valid predictions were generated for any seed.
+Completed test with num_recycles = 10
+
+---
+
 
 
 ---
