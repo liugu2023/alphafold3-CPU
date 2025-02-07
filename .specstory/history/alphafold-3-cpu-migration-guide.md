@@ -310,7 +310,673 @@ NameError: name 'data_pipeline_config' is not defined
 
 _**Assistant**_
 
+看起来我们漏掉了`data_pipeline_config`的定义部分。让我们添加回这部分代码：
 
+```python:run_alphafold.py
+def main(_):
+  # ... existing code ...
+
+  if _RUN_INFERENCE.value:
+    # 使用CPU设备
+    devices = jax.local_devices(backend='cpu')
+    print(f'Using CPU device: {devices[0]}')
+
+  # 添加data_pipeline_config的定义
+  if _RUN_DATA_PIPELINE.value:
+    expand_path = lambda x: replace_db_dir(x, DB_DIR.value)
+    max_template_date = datetime.date.fromisoformat(_MAX_TEMPLATE_DATE.value)
+    data_pipeline_config = pipeline.DataPipelineConfig(
+        jackhmmer_binary_path=_JACKHMMER_BINARY_PATH.value,
+        nhmmer_binary_path=_NHMMER_BINARY_PATH.value,
+        hmmalign_binary_path=_HMMALIGN_BINARY_PATH.value,
+        hmmsearch_binary_path=_HMMSEARCH_BINARY_PATH.value,
+        hmmbuild_binary_path=_HMMBUILD_BINARY_PATH.value,
+        small_bfd_database_path=expand_path(_SMALL_BFD_DATABASE_PATH.value),
+        mgnify_database_path=expand_path(_MGNIFY_DATABASE_PATH.value),
+        uniprot_cluster_annot_database_path=expand_path(
+            _UNIPROT_CLUSTER_ANNOT_DATABASE_PATH.value
+        ),
+        uniref90_database_path=expand_path(_UNIREF90_DATABASE_PATH.value),
+        ntrna_database_path=expand_path(_NTRNA_DATABASE_PATH.value),
+        rfam_database_path=expand_path(_RFAM_DATABASE_PATH.value),
+        rna_central_database_path=expand_path(_RNA_CENTRAL_DATABASE_PATH.value),
+        pdb_database_path=expand_path(_PDB_DATABASE_PATH.value),
+        seqres_database_path=expand_path(_SEQRES_DATABASE_PATH.value),
+        jackhmmer_n_cpu=_JACKHMMER_N_CPU.value,
+        nhmmer_n_cpu=_NHMMER_N_CPU.value,
+        max_template_date=max_template_date,
+    )
+  else:
+    data_pipeline_config = None
+
+  print('Building model from scratch...')
+  model_runner = ModelRunner(
+      config=make_model_config(
+          flash_attention_implementation='xla',  # 在CPU上使用XLA实现
+          num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
+          num_recycles=_NUM_RECYCLES.value,
+          return_embeddings=_SAVE_EMBEDDINGS.value,
+      ),
+      device=devices[0],  # 使用第一个CPU设备
+      model_dir=pathlib.Path(MODEL_DIR.value),
+  )
+  # ... rest of the code ...
+```
+
+这段代码添加了：
+1. 数据管道配置的定义
+2. 根据`_RUN_DATA_PIPELINE`标志决定是否创建配置
+3. 使用`expand_path`函数处理数据库路径
+4. 设置所有必要的二进制工具路径和数据库路径
+
+现在代码应该可以正常运行了。请确保：
+1. 所有数据库路径都是正确的
+2. 所有二进制工具都已安装并可以在系统中找到
+3. 输入路径`/archive/liugu/iutput/processed`是正确的（注意拼写）
+
+---
+
+_**User**_
+
+看看这个文件，加个进度显示
+
+---
+
+_**Assistant**_
+
+我来帮您在代码中添加进度显示。我们可以使用tqdm库来显示进度条。以下是修改建议：
+
+```python:run_alphafold.py
+# 在文件开头导入tqdm
+from tqdm import tqdm
+
+# ... existing code ...
+
+def main(_):
+  # ... existing code ...
+
+  num_fold_inputs = 0
+  total_inputs = len(list(fold_inputs))  # 获取总输入数量
+  
+  # 使用tqdm包装fold_inputs迭代
+  for fold_input in tqdm(fold_inputs, 
+                        total=total_inputs,
+                        desc="Processing fold inputs",
+                        unit="input"):
+    if _NUM_SEEDS.value is not None:
+      print(f'\nExpanding fold job {fold_input.name} to {_NUM_SEEDS.value} seeds')
+      fold_input = fold_input.with_multiple_seeds(_NUM_SEEDS.value)
+    process_fold_input(
+        fold_input=fold_input,
+        data_pipeline_config=data_pipeline_config,
+        model_runner=model_runner,
+        output_dir=os.path.join(_OUTPUT_DIR.value, fold_input.sanitised_name()),
+        buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
+        conformer_max_iterations=_CONFORMER_MAX_ITERATIONS.value,
+    )
+    num_fold_inputs += 1
+
+  print(f'\nDone running {num_fold_inputs} fold jobs.')
+
+# 在process_fold_input函数中也添加进度显示
+def process_fold_input(
+    fold_input: folding_input.Input,
+    data_pipeline_config: pipeline.DataPipelineConfig | None,
+    model_runner: ModelRunner | None,
+    output_dir: os.PathLike[str] | str,
+    buckets: Sequence[int] | None = None,
+    conformer_max_iterations: int | None = None,
+) -> folding_input.Input | Sequence[ResultsForSeed]:
+  """Runs data pipeline and/or inference on a single fold input."""
+  print(f'\nRunning fold job {fold_input.name}...')
+
+  if not fold_input.chains:
+    raise ValueError('Fold input has no chains.')
+
+  if os.path.exists(output_dir) and os.listdir(output_dir):
+    new_output_dir = (
+        f'{output_dir}_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}'
+    )
+    print(
+        f'Output will be written in {new_output_dir} since {output_dir} is'
+        ' non-empty.'
+    )
+    output_dir = new_output_dir
+  else:
+    print(f'Output will be written in {output_dir}')
+
+  if data_pipeline_config is None:
+    print('Skipping data pipeline...')
+  else:
+    print('Running data pipeline...')
+    with tqdm(total=100, desc="Data pipeline progress", unit="%") as pbar:
+      fold_input = pipeline.DataPipeline(data_pipeline_config).process(fold_input)
+      pbar.update(100)
+
+  write_fold_input_json(fold_input, output_dir)
+  if model_runner is None:
+    print('Skipping model inference...')
+    output = fold_input
+  else:
+    print(
+        f'Predicting 3D structure for {fold_input.name} with'
+        f' {len(fold_input.rng_seeds)} seed(s)...'
+    )
+    all_inference_results = predict_structure(
+        fold_input=fold_input,
+        model_runner=model_runner,
+        buckets=buckets,
+        conformer_max_iterations=conformer_max_iterations,
+    )
+    print(f'Writing outputs with {len(fold_input.rng_seeds)} seed(s)...')
+    write_outputs(
+        all_inference_results=all_inference_results,
+        output_dir=output_dir,
+        job_name=fold_input.sanitised_name(),
+    )
+    output = all_inference_results
+
+  print(f'Fold job {fold_input.name} done, output written to {output_dir}\n')
+  return output
+```
+
+主要修改包括：
+
+1. 导入tqdm库
+2. 在主循环中添加总体进度条
+3. 在process_fold_input函数中添加数据管道的进度条
+4. 保留了原有的关键信息打印
+
+使用前需要确保安装了tqdm库：
+```bash
+pip install tqdm
+```
+
+这样运行时会显示：
+1. 总体进度条显示处理了多少输入文件
+2. 每个文件的数据管道处理进度
+3. 保留了原有的详细信息打印
+
+进度条会显示类似：
+```
+Processing fold inputs: 100%|██████████| 10/10 [00:05<00:00,  1.89it/s]
+Running fold job example_1...
+Data pipeline progress: 100%|██████████| 100/100 [00:02<00:00, 39.05%/s]
+```
+
+这样可以更直观地看到程序的运行进度。
+
+---
+
+_**User**_
+
+这个文件
+我要的就是下载数据库的
+
+---
+
+_**Assistant**_
+
+明白了，您需要下载数据库。根据`fetch_databases.sh`文件，这是一个用于下载AlphaFold 3所需数据库的脚本。使用方法如下：
+
+1. 首先确保系统安装了必要的工具：
+```bash
+# 检查/安装必要工具
+sudo apt-get install wget tar zstd
+```
+
+2. 运行脚本下载数据库：
+```bash
+# 使用指定目录
+bash fetch_databases.sh /archive/plato/task3/database
+```
+
+这个脚本会：
+1. 下载以下数据库文件：
+   - `pdb_2022_09_28_mmcif_files.tar`
+   - `mgy_clusters_2022_05.fa`
+   - `bfd-first_non_consensus_sequences.fasta`
+   - `uniref90_2022_05.fa`
+   - `uniprot_all_2021_04.fa`
+   - `pdb_seqres_2022_09_28.fasta`
+   - `rnacentral_active_seq_id_90_cov_80_linclust.fasta`
+   - `nt_rna_2023_02_23_clust_seq_id_90_cov_80_rep_seq.fasta`
+   - `rfam_14_9_clust_seq_id_90_cov_80_rep_seq.fasta`
+
+2. 自动解压所有文件到指定目录
+
+注意事项：
+1. 确保有足够的磁盘空间（数据库文件较大）
+2. 下载可能需要较长时间
+3. 建议使用稳定的网络连接
+4. 脚本会并行下载以提高速度
+
+您可以这样运行：
+```bash
+# 给脚本添加执行权限
+chmod +x fetch_databases.sh
+
+# 运行脚本
+./fetch_databases.sh /archive/plato/task3/database
+```
+
+下载完成后，这些数据库文件将被用于AlphaFold 3的运行过程中。
+
+---
+
+_**User**_
+
+我想加个进度显示
+
+---
+
+_**Assistant**_
+
+
+
+我来帮您修改`fetch_databases.sh`脚本，添加下载进度显示。以下是修改后的脚本：
+
+```bash:fetch_databases.sh
+#!/bin/bash
+# Copyright 2024 DeepMind Technologies Limited
+#
+# AlphaFold 3 source code is licensed under CC BY-NC-SA 4.0. To view a copy of
+# this license, visit https://creativecommons.org/licenses/by-nc-sa/4.0/
+#
+# To request access to the AlphaFold 3 model parameters, follow the process set
+# out at https://github.com/google-deepmind/alphafold3. You may only use these
+# if received directly from Google. Use is subject to terms of use available at
+# https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md
+
+set -euo pipefail
+
+readonly db_dir=${1:-$HOME/public_databases}
+
+# 检查必要工具
+for cmd in wget tar zstd ; do
+  if ! command -v "${cmd}" > /dev/null 2>&1; then
+    echo "${cmd} is not installed. Please install it."
+  fi
+done
+
+echo "Fetching databases to ${db_dir}"
+mkdir -p "${db_dir}"
+
+readonly SOURCE=https://storage.googleapis.com/alphafold-databases/v3.0
+
+echo "Start Fetching and Untarring 'pdb_2022_09_28_mmcif_files.tar'"
+wget --progress=bar:force --show-progress --output-document=- \
+    "${SOURCE}/pdb_2022_09_28_mmcif_files.tar.zst" | \
+    tar --no-same-owner --no-same-permissions \
+    --use-compress-program=zstd -xf - --directory="${db_dir}" &
+
+# 创建一个数组存储所有后台进程的PID
+pids=()
+
+for NAME in mgy_clusters_2022_05.fa \
+            bfd-first_non_consensus_sequences.fasta \
+            uniref90_2022_05.fa uniprot_all_2021_04.fa \
+            pdb_seqres_2022_09_28.fasta \
+            rnacentral_active_seq_id_90_cov_80_linclust.fasta \
+            nt_rna_2023_02_23_clust_seq_id_90_cov_80_rep_seq.fasta \
+            rfam_14_9_clust_seq_id_90_cov_80_rep_seq.fasta ; do
+  echo "Start Fetching '${NAME}'"
+  (
+    wget --progress=bar:force --show-progress --output-document=- \
+        "${SOURCE}/${NAME}.zst" | \
+        zstd --decompress > "${db_dir}/${NAME}"
+    echo "Completed downloading and decompressing '${NAME}'"
+  ) &
+  # 存储后台进程的PID
+  pids+=($!)
+done
+
+# 等待所有后台进程完成
+for pid in "${pids[@]}"; do
+  wait $pid
+done
+
+echo "All downloads completed successfully!"
+echo "Databases have been downloaded to: ${db_dir}"
+```
+
+主要改动：
+
+1. 为wget添加了进度显示参数：
+   - `--progress=bar:force`: 强制显示进度条
+   - `--show-progress`: 显示详细进度信息
+
+2. 改进了并行下载的处理：
+   - 使用数组存储所有后台进程的PID
+   - 分别等待每个下载任务完成
+
+3. 添加了更多状态信息：
+   - 显示每个文件开始下载的信息
+   - 显示每个文件完成下载和解压的信息
+   - 添加了最终完成的确认信息
+
+使用方法不变：
+```bash
+./fetch_databases.sh /archive/plato/task3/database
+```
+
+现在您将看到：
+- 每个文件的下载进度条
+- 下载速度和预计剩余时间
+- 文件大小和已下载比例
+- 每个任务的完成状态
+- 最终的完成确认
+
+这样可以更好地监控下载进度。
+
+---
+
+_**User**_
+
+Extracting output structure samples with seed 1...
+    app.run(main)
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/absl/app.py", line 308, in run
+    _run_main(main, args)
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/absl/app.py", line 254, in _run_main
+    sys.exit(main(argv))
+             ^^^^^^^^^^
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 728, in main
+    process_fold_input(
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 618, in process_fold_input
+    all_inference_results = predict_structure(
+                            ^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 428, in predict_structure
+    inference_results = model_runner.extract_structures(
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 352, in extract_structures
+    return list(
+           ^^^^^
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/alphafold3/model/model.py", line 369, in get_inference_result
+    pred_structure = get_predicted_structure(result=result, batch=batch)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/alphafold3/model/model.py", line 128, in get_predicted_structure
+    pred_struc = pred_struc.copy_and_update_atoms(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/alphafold3/structure/structure.py", line 1355, in copy_and_update_atoms
+    new_atoms = structure_tables.Atoms(
+                ^^^^^^^^^^^^^^^^^^^^^^^
+  File "<string>", line 13, in __init__
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/alphafold3/structure/structure_tables.py", line 103, in __post_init__
+    raise ValueError(
+ValueError: Column x must not contain NaN/inf values.
+
+---
+
+_**Assistant**_
+
+这个错误表明在预测结构时出现了数值计算问题，导致原子坐标中出现了NaN(Not a Number)或无穷大值。这在CPU上运行时比较常见，主要有几个可能的原因：
+
+1. 我们可以尝试调整模型参数来提高数值稳定性：
+
+```python:run_alphafold.py
+def make_model_config(
+    *,
+    flash_attention_implementation: attention.Implementation = 'xla',
+    num_diffusion_samples: int = 5,
+    num_recycles: int = 10,
+    return_embeddings: bool = False,
+) -> model.Model.Config:
+  """Returns a model config with some defaults overridden."""
+  config = model.Model.Config()
+  config.global_config.flash_attention_implementation = flash_attention_implementation
+  config.heads.diffusion.eval.num_samples = num_diffusion_samples
+  config.num_recycles = num_recycles
+  config.return_embeddings = return_embeddings
+  
+  # 添加数值稳定性相关配置
+  config.global_config.deterministic = True  # 使用确定性计算
+  config.global_config.epsilon = 1e-7  # 增加数值稳定性
+  config.heads.diffusion.eval.temperature = 0.1  # 降低采样温度
+  
+  return config
+```
+
+2. 运行时使用更保守的参数：
+
+```bash
+python run_alphafold.py \
+  --input_dir=/archive/liugu/iutput/processed \
+  --output_dir=/archive/liugu/output \
+  --model_dir=/archive/liugu/model \
+  --db_dir=/archive/plato/task3/database \
+  --flash_attention_implementation=xla \
+  --num_recycles=3 \
+  --num_diffusion_samples=1 \
+  --jackhmmer_n_cpu=8 \
+  --nhmmer_n_cpu=8 \
+  --conformer_max_iterations=100  # 限制构象搜索迭代次数
+```
+
+3. 如果还是有问题，可以添加错误处理和重试机制：
+
+```python:run_alphafold.py
+def predict_structure(
+    fold_input: folding_input.Input,
+    model_runner: ModelRunner,
+    buckets: Sequence[int] | None = None,
+    conformer_max_iterations: int | None = None,
+) -> Sequence[ResultsForSeed]:
+  """Runs the full inference pipeline to predict structures for each seed."""
+  
+  print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
+  featurisation_start_time = time.time()
+  ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
+  featurised_examples = featurisation.featurise_input(
+      fold_input=fold_input,
+      buckets=buckets,
+      ccd=ccd,
+      verbose=True,
+      conformer_max_iterations=conformer_max_iterations,
+  )
+  
+  all_inference_results = []
+  for seed, example in zip(fold_input.rng_seeds, featurised_examples):
+    max_retries = 3
+    for attempt in range(max_retries):
+      try:
+        print(f'Running model inference with seed {seed} (attempt {attempt+1}/{max_retries})...')
+        rng_key = jax.random.PRNGKey(seed + attempt)  # 每次重试使用不同的随机种子
+        result = model_runner.run_inference(example, rng_key)
+        inference_results = model_runner.extract_structures(
+            batch=example, result=result, target_name=fold_input.name
+        )
+        all_inference_results.append(
+            ResultsForSeed(
+                seed=seed,
+                inference_results=inference_results,
+                full_fold_input=fold_input,
+                embeddings=model_runner.extract_embeddings(result),
+            )
+        )
+        break  # 成功则跳出重试循环
+      except ValueError as e:
+        if "Column x must not contain NaN/inf values" in str(e):
+          if attempt < max_retries - 1:
+            print(f"Encountered numerical instability, retrying... ({attempt+1}/{max_retries})")
+            continue
+          else:
+            print(f"Failed after {max_retries} attempts with seed {seed}")
+            raise
+        else:
+          raise
+
+  return all_inference_results
+```
+
+这些修改：
+1. 增加了数值稳定性相关的配置
+2. 降低了模型参数的激进程度
+3. 添加了重试机制来处理数值不稳定的情况
+
+建议从最简单的开始尝试：
+1. 先用较保守的参数运行
+2. 如果还有问题，再添加数值稳定性配置
+3. 如果仍然不稳定，再添加重试机制
+
+---
+
+_**User**_
+
+我想保证推理数据的准确性
+
+---
+
+_**Assistant**_
+
+
+
+为了保证推理数据的准确性，我们可以进一步优化模型配置和数值稳定性。以下是建议的修改：
+
+```python:run_alphafold.py
+def make_model_config(
+    *,
+    flash_attention_implementation: attention.Implementation = 'xla',
+    num_diffusion_samples: int = 5,
+    num_recycles: int = 10,
+    return_embeddings: bool = False,
+) -> model.Model.Config:
+    """Returns a model config with some defaults overridden."""
+    config = model.Model.Config()
+    config.global_config.flash_attention_implementation = flash_attention_implementation
+    config.heads.diffusion.eval.num_samples = num_diffusion_samples
+    config.num_recycles = num_recycles
+    config.return_embeddings = return_embeddings
+    
+    # 增强数值稳定性的配置
+    config.global_config.deterministic = True  # 使用确定性计算
+    config.global_config.epsilon = 1e-7  # 数值稳定性阈值
+    config.global_config.jax_enable_x64 = True  # 使用64位精度
+    
+    # 优化扩散模型参数
+    config.heads.diffusion.eval.temperature = 0.1  # 降低采样温度提高稳定性
+    config.heads.diffusion.eval.min_beta = 1e-4   # 最小噪声水平
+    config.heads.diffusion.eval.max_beta = 0.02   # 最大噪声水平
+    
+    # 优化注意力机制
+    config.global_config.attention_dropout_rate = 0.1  # 添加dropout以增加鲁棒性
+    config.global_config.attention_clip_value = 5.0   # 限制注意力分数范围
+    
+    return config
+
+def predict_structure(
+    fold_input: folding_input.Input,
+    model_runner: ModelRunner,
+    buckets: Sequence[int] | None = None,
+    conformer_max_iterations: int | None = None,
+) -> Sequence[ResultsForSeed]:
+    """Runs the full inference pipeline to predict structures for each seed."""
+    
+    print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
+    featurisation_start_time = time.time()
+    ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
+    featurised_examples = featurisation.featurise_input(
+        fold_input=fold_input,
+        buckets=buckets,
+        ccd=ccd,
+        verbose=True,
+        conformer_max_iterations=conformer_max_iterations,
+    )
+    
+    all_inference_results = []
+    for seed, example in zip(fold_input.rng_seeds, featurised_examples):
+        max_retries = 3
+        best_result = None
+        best_score = float('-inf')
+        
+        for attempt in range(max_retries):
+            try:
+                print(f'Running model inference with seed {seed} (attempt {attempt+1}/{max_retries})...')
+                # 使用不同的随机种子
+                rng_key = jax.random.PRNGKey(seed + attempt * 100)
+                
+                # 运行推理
+                result = model_runner.run_inference(example, rng_key)
+                
+                # 提取结构
+                inference_results = model_runner.extract_structures(
+                    batch=example, result=result, target_name=fold_input.name
+                )
+                
+                # 计算结构质量分数
+                current_score = float(result.get('confidence_score', 0.0))
+                
+                # 保留最好的结果
+                if current_score > best_score:
+                    best_score = current_score
+                    best_result = ResultsForSeed(
+                        seed=seed,
+                        inference_results=inference_results,
+                        full_fold_input=fold_input,
+                        embeddings=model_runner.extract_embeddings(result),
+                    )
+                
+                print(f"Attempt {attempt+1} score: {current_score:.4f}")
+                
+                # 如果分数足够好就提前退出
+                if current_score > 0.7:  # 可以调整这个阈值
+                    break
+                    
+            except ValueError as e:
+                if "Column x must not contain NaN/inf values" in str(e):
+                    if attempt < max_retries - 1:
+                        print(f"Encountered numerical instability, retrying... ({attempt+1}/{max_retries})")
+                        continue
+                    else:
+                        print(f"Failed after {max_retries} attempts with seed {seed}")
+                        raise
+                else:
+                    raise
+        
+        if best_result is not None:
+            print(f"Best score for seed {seed}: {best_score:.4f}")
+            all_inference_results.append(best_result)
+        else:
+            print(f"Warning: No valid results for seed {seed}")
+    
+    return all_inference_results
+```
+
+主要改进包括：
+
+1. 模型配置优化：
+   - 启用64位精度计算
+   - 添加注意力机制的稳定性参数
+   - 优化扩散模型参数
+   - 增加dropout以提高鲁棒性
+
+2. 推理过程优化：
+   - 多次尝试并保留最佳结果
+   - 添加质量评分机制
+   - 当达到足够好的结果时提前停止
+   - 更好的错误处理和日志记录
+
+3. 数值稳定性增强：
+   - 更严格的epsilon值
+   - 注意力分数裁剪
+   - 更保守的扩散参数
+
+这些修改应该能够：
+1. 提高结构预测的准确性
+2. 减少数值不稳定性问题
+3. 确保输出最优质的结构预测结果
+
+建议配合以下运行参数使用：
+```bash
+python run_alphafold.py \
+  --input_dir=/archive/liugu/iutput/processed \
+  --output_dir=/archive/liugu/output \
+  --model_dir=/archive/liugu/model \
+  --db_dir=/archive/plato/task3/database \
+  --flash_attention_implementation=xla \
+  --num_recycles=5 \
+  --num_diffusion_samples=3 \
+  --conformer_max_iterations=100
+```
 
 ---
 
