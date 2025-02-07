@@ -421,17 +421,14 @@ def predict_structure(
     featurisation_start_time = time.time()
     ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
     
-    # 修改为单线程处理，避免 fork 问题
-    featurised_examples = []
-    for chunk in fold_input.chunks:
-        example = featurisation.featurise_input(
-            fold_input=chunk,
-            buckets=buckets,
-            ccd=ccd,
-            verbose=False,
-            conformer_max_iterations=conformer_max_iterations
-        )
-        featurised_examples.append(example)
+    # 直接处理整个 fold_input
+    featurised_examples = featurisation.featurise_input(
+        fold_input=fold_input,
+        buckets=buckets,
+        ccd=ccd,
+        verbose=True,
+        conformer_max_iterations=conformer_max_iterations,
+    )
     
     print(
         f'Featurising data with {len(fold_input.rng_seeds)} seed(s) took'
@@ -444,7 +441,7 @@ def predict_structure(
     all_inference_start_time = time.time()
     all_inference_results = []
     
-    for seed, example in zip(fold_input.rng_seeds, featurised_examples):
+    for seed, example in zip(fold_input.rng_seeds, [featurised_examples]):
         print(f'Running model inference with seed {seed}...')
         inference_start_time = time.time()
         rng_key = jax.random.PRNGKey(seed)
