@@ -105,6 +105,112 @@ def main(_):
 
 ---
 
+_**User**_
+
+给出运行命令
+
+---
+
+_**Assistant**_
+
+我来提供在CPU上运行AlphaFold 3的命令。以下是基本的运行命令和一些常用选项:
+
+```bash
+python run_alphafold.py \
+  --json_path=/path/to/input.json \
+  --output_dir=/path/to/output \
+  --model_dir=/path/to/model_params \
+  --db_dir=/path/to/databases \
+  --flash_attention_implementation=xla \
+  --num_recycles=3 \
+  --num_diffusion_samples=1
+```
+
+主要参数说明:
+
+1. 必需参数:
+```bash
+--json_path          # 输入JSON文件路径(与--input_dir二选一)
+--output_dir         # 输出目录
+```
+
+2. 重要路径参数:
+```bash
+--model_dir          # 模型参数目录
+--db_dir             # 数据库目录
+```
+
+3. CPU优化参数:
+```bash
+--flash_attention_implementation=xla  # 使用XLA实现
+--num_recycles=3                     # 减少循环次数以加快运行
+--num_diffusion_samples=1            # 减少扩散采样数量
+```
+
+4. 可选的性能调优参数:
+```bash
+--jackhmmer_n_cpu=4   # 限制MSA搜索的CPU使用数量
+--nhmmer_n_cpu=4      # 限制RNA MSA搜索的CPU使用数量
+```
+
+5. 其他有用的选项:
+```bash
+--run_data_pipeline=true   # 是否运行数据预处理管道
+--run_inference=true       # 是否运行推理
+--save_embeddings=false    # 是否保存嵌入向量
+```
+
+使用建议:
+
+1. 由于在CPU上运行,建议:
+   - 减少`num_recycles`(默认10)
+   - 减少`num_diffusion_samples`(默认5)
+   - 适当限制CPU核心使用数量
+
+2. 对于测试目的,可以使用最小配置:
+```bash
+python run_alphafold.py \
+  --json_path=test_input.json \
+  --output_dir=./output \
+  --model_dir=./models \
+  --db_dir=./databases \
+  --num_recycles=1 \
+  --num_diffusion_samples=1
+```
+
+3. 对于生产用途,可以使用更多资源:
+```bash
+python run_alphafold.py \
+  --json_path=prod_input.json \
+  --output_dir=./results \
+  --model_dir=./models \
+  --db_dir=./databases \
+  --num_recycles=5 \
+  --num_diffusion_samples=3 \
+  --jackhmmer_n_cpu=8 \
+  --nhmmer_n_cpu=8
+```
+
+请注意:
+- 在CPU上运行会显著增加计算时间
+- 建议先用小数据集测试
+- 根据实际CPU性能和内存大小调整参数
+- 确保有足够的磁盘空间存储输出结果
+
+---
+
+_**User**_
+
+输入：/archive/liugu/iutput/processed    输出：/archive/liugu/output    模型权重：/archive/liugu/model    数据库：/archive/plato/task3/database
+
+---
+
+_**Assistant**_
+
+
+
+---
+
 
 
 ---
