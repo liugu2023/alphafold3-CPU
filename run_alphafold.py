@@ -445,24 +445,24 @@ def predict_structure(
     featurised_examples = []
     def validate_features(example):
         """验证特征的有效性"""
+        def check_numeric_array(value, key):
+            if isinstance(value, (np.ndarray, jnp.ndarray)):
+                if value.dtype.kind in 'fc':  # 只检查浮点数和复数类型
+                    if np.any(np.isnan(value)):
+                        print(f"Warning: NaN in feature {key} of shape {value.shape}")
+                    if np.any(np.isinf(value)):
+                        print(f"Warning: Inf in feature {key} of shape {value.shape}")
+        
         if isinstance(example, list):
             # 如果是列表，验证每个元素
             for item in example:
                 if isinstance(item, dict):
                     for key, value in item.items():
-                        if isinstance(value, (np.ndarray, jnp.ndarray)):
-                            if np.any(np.isnan(value)):
-                                print(f"Warning: NaN in feature {key} of shape {value.shape}")
-                            if np.any(np.isinf(value)):
-                                print(f"Warning: Inf in feature {key} of shape {value.shape}")
+                        check_numeric_array(value, key)
         elif isinstance(example, dict):
             # 如果是字典，直接验证
             for key, value in example.items():
-                if isinstance(value, (np.ndarray, jnp.ndarray)):
-                    if np.any(np.isnan(value)):
-                        print(f"Warning: NaN in feature {key} of shape {value.shape}")
-                    if np.any(np.isinf(value)):
-                        print(f"Warning: Inf in feature {key} of shape {value.shape}")
+                check_numeric_array(value, key)
         return example
     
     for seed in fold_input.rng_seeds:

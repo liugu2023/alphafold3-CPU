@@ -1845,7 +1845,192 @@ _**Assistant**_
 
 
 
-看起来问题出在 `validate_features` 函数中，
+看起来问题出在 `validate_features` 函数中，我们需要修改特征验证的逻辑。让我们修改 `predict_structure` 函数：
+
+```python:run_alphafold.py
+def predict_structure(
+    fold_input: folding_input.Input,
+    model_runner: ModelRunner,
+    buckets: Sequence[int] | None = None,
+    conformer_max_iterations: int | None = None,
+) -> Sequence[ResultsForSeed]:
+    """Runs the full inference pipeline to predict structures for each seed."""
+
+    print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
+    featurisation_start_time = time.time()
+    ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
+    
+    # 特征化处理
+    featurised_examples = []
+    def validate_features(example):
+        """验证特征的有效性"""
+        if isinstance(example, list):
+            # 如果是列表，验证每个元素
+            for item in example:
+                if isinstance(item, dict):
+                    for key, value in item.items():
+                        if isinstance(value, (np.ndarray, jnp.ndarray)):
+                            if np.any(np.isnan(value)):
+                                print(f"Warning: NaN in feature {key} of shape {value.shape}")
+                            if np.any(np.isinf(value)):
+                                print(f"Warning: Inf in feature {key} of shape {value.shape}")
+        elif isinstance(example, dict):
+            # 如果是字典，直接验证
+            for key, value in example.items():
+                if isinstance(value, (np.ndarray, jnp.ndarray)):
+                    if np.any(np.isnan(value)):
+                        print(f"Warning: NaN in feature {key} of shape {value.shape}")
+                    if np.any(np.isinf(value)):
+                        print(f"Warning: Inf in feature {key} of shape {value.shape}")
+        return example
+    
+    for seed in fold_input.rng_seeds:
+        print(f'Featurising data with seed {seed}.')
+        example = featurisation.featurise_input(
+            fold_input=fold_input,
+            buckets=buckets,
+            ccd=ccd,
+            verbose=True,
+            conformer_max_iterations=conformer_max_iterations,
+        )
+        example = validate_features(example)
+        featurised_examples.append(example)
+    
+    print(
+        f'Featurising data with {len(fold_input.rng_seeds)} seed(s) took'
+        f' {time.time() - featurisation_start_time:.2f} seconds.'
+    )
+    
+    # ... 其余代码保持不变 ...
+```
+
+主要修改：
+1. 改进了 `validate_features` 函数，使其能处理列表和字典类型的输入
+2. 添加了更详细的类型检查
+3. 保持了原有的 NaN/inf 检查功能
+
+同时，我们还应该在 `make_model_config` 中添加一些数值稳定性的配置：
+
+```python:run_alphafold.py
+def make_model_config(...) -> model.Model.Config:
+    config = model.Model.Config()
+    
+    # 修改数值计算配置
+    config.global_config.precision = jnp.float32
+    config.global_config.deterministic = True
+    config.global_config.subbatch_size = 4  # 减小批次大小以提高稳定性
+    
+    # 数值稳定性配置
+    config.global_config.eps = 1e-6
+    config.global_config.inf_value = 1e6
+    config.global_config.nan_guard = True
+    config.global_config.softmax_scale = 0.5  # 降低 softmax 温度
+    
+    # 注意力机制配置
+    config.global_config.attention_clip = True
+    config.global_config.attention_max = 10.0
+    
+    return config
+```
+
+这些修改应该能解决 NaN/inf 的问题。需要我解释更多细节吗？
+
+---
+
+_**User**_
+
+Traceback (most recent call last):
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 901, in <module>
+    app.run(main)
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/absl/app.py", line 308, in run
+    _run_main(main, args)
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/absl/app.py", line 254, in _run_main
+    sys.exit(main(argv))
+             ^^^^^^^^^^
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 886, in main
+    process_fold_input(
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 739, in process_fold_input
+    all_inference_results = predict_structure(
+                            ^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 477, in predict_structure
+    example = validate_features(example)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 454, in validate_features
+    if np.any(np.isnan(value)):
+              ^^^^^^^^^^^^^^^
+TypeError: ufunc 'isnan' not supported for the input types, and the inputs could not be safely coerced to any supported types according to the casting rule ''safe''
+
+---
+
+_**Assistant**_
+
+
+
+看起来问题出在数值类型检查上。让我们修改 `validate_features` 函数，添加更严格的类型检查：
+
+```python:run_alphafold.py
+def predict_structure(
+    fold_input: folding_input.Input,
+    model_runner: ModelRunner,
+    buckets: Sequence[int] | None = None,
+    conformer_max_iterations: int | None = None,
+) -> Sequence[ResultsForSeed]:
+    """Runs the full inference pipeline to predict structures for each seed."""
+
+    print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
+    featurisation_start_time = time.time()
+    ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
+    
+    # 特征化处理
+    featurised_examples = []
+    def validate_features(example):
+        """验证特征的有效性"""
+        def check_numeric_array(value, key):
+            if isinstance(value, (np.ndarray, jnp.ndarray)):
+                if value.dtype.kind in 'fc':  # 只检查浮点数和复数类型
+                    if np.any(np.isnan(value)):
+                        print(f"Warning: NaN in feature {key} of shape {value.shape}")
+                    if np.any(np.isinf(value)):
+                        print(f"Warning: Inf in feature {key} of shape {value.shape}")
+        
+        if isinstance(example, list):
+            # 如果是列表，验证每个元素
+            for item in example:
+                if isinstance(item, dict):
+                    for key, value in item.items():
+                        check_numeric_array(value, key)
+        elif isinstance(example, dict):
+            # 如果是字典，直接验证
+            for key, value in example.items():
+                check_numeric_array(value, key)
+        return example
+    
+    for seed in fold_input.rng_seeds:
+        print(f'Featurising data with seed {seed}.')
+        example = featurisation.featurise_input(
+            fold_input=fold_input,
+            buckets=buckets,
+            ccd=ccd,
+            verbose=True,
+            conformer_max_iterations=conformer_max_iterations,
+        )
+        example = validate_features(example)
+        featurised_examples.append(example)
+    
+    # ... 其余代码保持不变 ...
+```
+
+主要修改：
+1. 添加了 `check_numeric_array` 辅助函数
+2. 只对浮点数和复数类型的数组进行 NaN/inf 检查
+3. 使用 `dtype.kind` 来判断数组类型
+
+这样应该能避免类型错误。让我们重新运行测试：
+```bash
+./test_performance.sh
+```
+
+需要我解释更多细节吗？
 
 ---
 
