@@ -212,10 +212,8 @@ _JAX_COMPILATION_CACHE_DIR = flags.DEFINE_string(
 )
 _GPU_DEVICE = flags.DEFINE_integer(
     'gpu_device',
-    0,
-    'Optional override for the GPU device to use for inference. Defaults to the'
-    ' 1st GPU on the system. Useful on multi-GPU systems to pin each run to a'
-    ' specific GPU.',
+    None,  # 改为None默认值
+    'Deprecated. AlphaFold 3 now runs on CPU only.',
 )
 _BUCKETS = flags.DEFINE_list(
     'buckets',
@@ -673,94 +671,22 @@ def main(_):
     raise
 
   if _RUN_INFERENCE.value:
-    # Fail early on incompatible devices, but only if we're running inference.
-    gpu_devices = jax.local_devices(backend='gpu')
-    if gpu_devices:
-      compute_capability = float(
-          gpu_devices[_GPU_DEVICE.value].compute_capability
-      )
-      if compute_capability < 6.0:
-        raise ValueError(
-            'AlphaFold 3 requires at least GPU compute capability 6.0 (see'
-            ' https://developer.nvidia.com/cuda-gpus).'
-        )
-      elif 7.0 <= compute_capability < 8.0:
-        xla_flags = os.environ.get('XLA_FLAGS')
-        required_flag = '--xla_disable_hlo_passes=custom-kernel-fusion-rewriter'
-        if not xla_flags or required_flag not in xla_flags:
-          raise ValueError(
-              'For devices with GPU compute capability 7.x (see'
-              ' https://developer.nvidia.com/cuda-gpus) the ENV XLA_FLAGS must'
-              f' include "{required_flag}".'
-          )
-        if _FLASH_ATTENTION_IMPLEMENTATION.value != 'xla':
-          raise ValueError(
-              'For devices with GPU compute capability 7.x (see'
-              ' https://developer.nvidia.com/cuda-gpus) the'
-              ' --flash_attention_implementation must be set to "xla".'
-          )
-
-  notice = textwrap.wrap(
-      'Running AlphaFold 3. Please note that standard AlphaFold 3 model'
-      ' parameters are only available under terms of use provided at'
-      ' https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md.'
-      ' If you do not agree to these terms and are using AlphaFold 3 derived'
-      ' model parameters, cancel execution of AlphaFold 3 inference with'
-      ' CTRL-C, and do not use the model parameters.',
-      break_long_words=False,
-      break_on_hyphens=False,
-      width=80,
-  )
-  print('\n' + '\n'.join(notice) + '\n')
-
-  if _RUN_DATA_PIPELINE.value:
-    expand_path = lambda x: replace_db_dir(x, DB_DIR.value)
-    max_template_date = datetime.date.fromisoformat(_MAX_TEMPLATE_DATE.value)
-    data_pipeline_config = pipeline.DataPipelineConfig(
-        jackhmmer_binary_path=_JACKHMMER_BINARY_PATH.value,
-        nhmmer_binary_path=_NHMMER_BINARY_PATH.value,
-        hmmalign_binary_path=_HMMALIGN_BINARY_PATH.value,
-        hmmsearch_binary_path=_HMMSEARCH_BINARY_PATH.value,
-        hmmbuild_binary_path=_HMMBUILD_BINARY_PATH.value,
-        small_bfd_database_path=expand_path(_SMALL_BFD_DATABASE_PATH.value),
-        mgnify_database_path=expand_path(_MGNIFY_DATABASE_PATH.value),
-        uniprot_cluster_annot_database_path=expand_path(
-            _UNIPROT_CLUSTER_ANNOT_DATABASE_PATH.value
-        ),
-        uniref90_database_path=expand_path(_UNIREF90_DATABASE_PATH.value),
-        ntrna_database_path=expand_path(_NTRNA_DATABASE_PATH.value),
-        rfam_database_path=expand_path(_RFAM_DATABASE_PATH.value),
-        rna_central_database_path=expand_path(_RNA_CENTRAL_DATABASE_PATH.value),
-        pdb_database_path=expand_path(_PDB_DATABASE_PATH.value),
-        seqres_database_path=expand_path(_SEQRES_DATABASE_PATH.value),
-        jackhmmer_n_cpu=_JACKHMMER_N_CPU.value,
-        nhmmer_n_cpu=_NHMMER_N_CPU.value,
-        max_template_date=max_template_date,
-    )
-  else:
-    data_pipeline_config = None
-
-  if _RUN_INFERENCE.value:
-    devices = jax.local_devices(backend='gpu')
-    print(
-        f'Found local devices: {devices}, using device {_GPU_DEVICE.value}:'
-        f' {devices[_GPU_DEVICE.value]}'
-    )
+    # 使用CPU设备
+    devices = jax.local_devices(backend='cpu')
+    print(f'Using CPU device: {devices[0]}')
 
     print('Building model from scratch...')
     model_runner = ModelRunner(
         config=make_model_config(
-            flash_attention_implementation=typing.cast(
-                attention.Implementation, _FLASH_ATTENTION_IMPLEMENTATION.value
-            ),
+            flash_attention_implementation='xla',  # 在CPU上使用XLA实现
             num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
             num_recycles=_NUM_RECYCLES.value,
             return_embeddings=_SAVE_EMBEDDINGS.value,
         ),
-        device=devices[_GPU_DEVICE.value],
+        device=devices[0],  # 使用第一个CPU设备
         model_dir=pathlib.Path(MODEL_DIR.value),
     )
-    # Check we can load the model parameters before launching anything.
+    # 检查模型参数是否可以加载
     print('Checking that model parameters can be loaded...')
     _ = model_runner.model_params
   else:
