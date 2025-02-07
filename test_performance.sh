@@ -29,6 +29,27 @@ for recycles in 3 5 8 10; do
     echo "Start time: $(date)" >> $TIME_LOG
     START_TIME=$(date +%s)
     
+    # 创建性能监控日志文件
+    PERF_LOG="$OUTPUT_DIR/performance_metrics.log"
+    
+    # 在后台启动性能监控
+    (
+        while true; do
+            # CPU使用率
+            CPU_USAGE=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}')
+            # 内存使用情况
+            MEM_INFO=$(free -m | grep Mem)
+            MEM_USED=$(echo $MEM_INFO | awk '{print $3}')
+            MEM_TOTAL=$(echo $MEM_INFO | awk '{print $2}')
+            # GPU使用情况
+            GPU_STATS=$(nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits)
+            
+            echo "$(date +%s),CPU:$CPU_USAGE%,MEM:$MEM_USED/$MEM_TOTAL MB,$GPU_STATS" >> $PERF_LOG
+            sleep 5
+        done
+    ) &
+    MONITOR_PID=$!
+    
     # 运行 AlphaFold
     python run_alphafold.py \
       --json_path=$INPUT_FILE \
@@ -40,7 +61,36 @@ for recycles in 3 5 8 10; do
       --jackhmmer_n_cpu=30 \
       --nhmmer_n_cpu=30 \
       2>&1 | tee $FULL_LOG
-      
+    
+    # 停止性能监控
+    kill $MONITOR_PID
+    
+    # 分析性能数据
+    echo -e "\nPerformance Analysis for num_recycles=$recycles:" >> "$BASE_DIR/performance_analysis.txt"
+    echo "----------------------------------------" >> "$BASE_DIR/performance_analysis.txt"
+    
+    # CPU使用率统计
+    echo "CPU Usage Statistics:" >> "$BASE_DIR/performance_analysis.txt"
+    awk -F',' '{print $2}' $PERF_LOG | cut -d':' -f2 | cut -d'%' -f1 | \
+        awk '{sum+=$1; if(NR==1||$1>max){max=$1}; if(NR==1||$1<min){min=$1}} 
+             END{printf "Average: %.2f%%, Max: %.2f%%, Min: %.2f%%\n", sum/NR, max, min}' \
+        >> "$BASE_DIR/performance_analysis.txt"
+    
+    # GPU使用率统计
+    echo "GPU Usage Statistics:" >> "$BASE_DIR/performance_analysis.txt"
+    awk -F',' '{print $4}' $PERF_LOG | \
+        awk '{sum+=$1; if(NR==1||$1>max){max=$1}; if(NR==1||$1<min){min=$1}} 
+             END{printf "Average: %.2f%%, Max: %.2f%%, Min: %.2f%%\n", sum/NR, max, min}' \
+        >> "$BASE_DIR/performance_analysis.txt"
+    
+    # 内存使用统计
+    echo "Memory Usage Statistics (MB):" >> "$BASE_DIR/performance_analysis.txt"
+    awk -F',' '{print $3}' $PERF_LOG | cut -d':' -f2 | \
+        awk -F'/' '{sum+=$1; if(NR==1||$1>max){max=$1}; if(NR==1||$1<min){min=$1}} 
+             END{printf "Average: %.2f, Max: %.2f, Min: %.2f (Total: %d)\n", 
+                 sum/NR, max, min, $2}' \
+        >> "$BASE_DIR/performance_analysis.txt"
+    
     # 记录结束时间和运行时间
     END_TIME=$(date +%s)
     DURATION=$((END_TIME - START_TIME))
