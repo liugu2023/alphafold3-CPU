@@ -330,38 +330,54 @@ class ModelRunner:
     def run_inference(
         self, featurised_example: features.BatchDict, rng_key: jnp.ndarray
     ) -> model.ModelResult:
-        """Computes a forward pass of the model on a featurised example."""
-        # 输入预处理
+        """计算模型在特征化样本上的前向传播。"""
+        # 输入预处理和数值稳定性检查
+        def preprocess_features(x):
+            if isinstance(x, (np.ndarray, jnp.ndarray)) and x.dtype.kind in 'fc':
+                # 归一化数值特征
+                mean = np.mean(x)
+                std = np.std(x)
+                if std > 0:
+                    x = (x - mean) / (std + 1e-7)
+                # 裁剪异常值
+                x = np.clip(x, -1e6, 1e6)
+            return x
+            
+        featurised_example = jax.tree_util.tree_map(
+            preprocess_features,
+            featurised_example
+        )
+
+        # 转移到设备
         featurised_example = jax.device_put(
             jax.tree_util.tree_map(
-                jnp.asarray, utils.remove_invalidly_typed_feats(featurised_example)
+                jnp.asarray, 
+                utils.remove_invalidly_typed_feats(featurised_example)
             ),
             self._device,
         )
 
-        # 运行模型
+        # 运行模型推理
         result = self._model(rng_key, featurised_example)
         
         # 后处理结果
-        result = jax.tree_util.tree_map(np.asarray, result)
-        result = jax.tree_util.tree_map(
-            lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x,
-            result,
-        )
-        
-        # 只在debug时检查数值
-        if os.environ.get('AF_DEBUG'):
-            def check_values(x):
-                if isinstance(x, (np.ndarray, jnp.ndarray)) and x.dtype.kind in 'fc':
-                    if np.any(np.isnan(x)):
-                        print(f"Warning: NaN detected in array of shape {x.shape}")
-                    if np.any(np.isinf(x)):
-                        print(f"Warning: Inf detected in array of shape {x.shape}")
-                return x
-            result = jax.tree_util.tree_map(check_values, result)
-        
+        def postprocess_result(x):
+            if isinstance(x, (np.ndarray, jnp.ndarray)):
+                # 转换数据类型
+                if x.dtype == jnp.bfloat16:
+                    x = x.astype(jnp.float32)
+                # 处理数值问题    
+                if np.any(np.isnan(x)) or np.any(np.isinf(x)):
+                    print(f"Warning: Found NaN/inf in array of shape {x.shape}")
+                    x = np.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
+                # 数值裁剪
+                x = np.clip(x, -1e6, 1e6)
+            return x
+            
+        result = jax.tree_util.tree_map(postprocess_result, result)
         result = dict(result)
         result['__identifier__'] = self.model_params['__meta__']['__identifier__'].tobytes()
+        
         return result
 
     def _preprocess_features(self, features):
@@ -376,12 +392,38 @@ class ModelRunner:
         result: model.ModelResult,
         target_name: str,
     ) -> list[model.InferenceResult]:
-        """Generates structures from model outputs."""
-        return list(
-            model.Model.get_inference_result(
-                batch=batch, result=result, target_name=target_name
+        """从模型输出生成结构。"""
+        try:
+            inference_results = list(
+                model.Model.get_inference_result(
+                    batch=batch, result=result, target_name=target_name
+                )
             )
-        )
+            
+            # 验证结构结果
+            valid_results = []
+            for idx, res in enumerate(inference_results):
+                if not hasattr(res, 'positions') or res.positions is None:
+                    print(f"Warning: Sample {idx} missing positions")
+                    continue
+                    
+                positions = res.positions
+                if np.any(np.isnan(positions)) or np.any(np.isinf(positions)):
+                    print(f"Warning: Sample {idx} has invalid positions")
+                    positions = np.nan_to_num(positions, nan=0.0, posinf=1e6, neginf=-1e6)
+                    positions = np.clip(positions, -1e6, 1e6)
+                    res.positions = positions
+                    
+                valid_results.append(res)
+                
+            if not valid_results:
+                raise ValueError("No valid structure samples generated")
+                
+            return valid_results
+            
+        except Exception as e:
+            print(f"Error in structure extraction: {str(e)}")
+            raise
 
     def extract_embeddings(
         self,
@@ -430,7 +472,7 @@ def predict_structure(
     buckets: Sequence[int] | None = None,
     conformer_max_iterations: int | None = None,
 ) -> Sequence[ResultsForSeed]:
-    """Runs the full inference pipeline to predict structures for each seed."""
+    """运行完整的推理流水线来预测每个种子的结构。"""
 
     print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
     featurisation_start_time = time.time()
@@ -438,119 +480,56 @@ def predict_structure(
     
     # 特征化处理
     featurised_examples = []
-    def validate_features(example):
-        """基本的特征验证"""
-        if isinstance(example, dict):
-            for key, value in example.items():
-                if isinstance(value, (np.ndarray, jnp.ndarray)):
-                    if value.dtype.kind in 'fc' and (np.any(np.isnan(value)) or np.any(np.isinf(value))):
-                        print(f"Warning: Invalid values in feature {key}")
-        return example
-    
     for seed in fold_input.rng_seeds:
         print(f'Featurising data with seed {seed}.')
-        example = featurisation.featurise_input(
-            fold_input=fold_input,
-            buckets=buckets,
-            ccd=ccd,
-            verbose=True,
-            conformer_max_iterations=conformer_max_iterations,
-        )
-        example = validate_features(example)
-        featurised_examples.append(example)
-    
+        try:
+            example = featurisation.featurise_input(
+                fold_input=fold_input,
+                buckets=buckets,
+                ccd=ccd,
+                verbose=True,
+                conformer_max_iterations=conformer_max_iterations,
+            )
+            featurised_examples.append(example)
+        except Exception as e:
+            print(f"Error in featurisation for seed {seed}: {e}")
+            continue
+
+    if not featurised_examples:
+        raise ValueError("Failed to featurise any examples")
+
     print(
-        f'Featurising data with {len(fold_input.rng_seeds)} seed(s) took'
-        f' {time.time() - featurisation_start_time:.2f} seconds.'
+        f'Featurising data took {time.time() - featurisation_start_time:.2f} seconds.'
     )
-    print(
-        'Running model inference and extracting output structure samples with'
-        f' {len(fold_input.rng_seeds)} seed(s)...'
-    )
-    all_inference_start_time = time.time()
+
     all_inference_results = []
-    
     for seed, example in zip(fold_input.rng_seeds, featurised_examples):
         print(f'Running model inference with seed {seed}...')
-        inference_start_time = time.time()
-        rng_key = jax.random.PRNGKey(seed)
-        
         try:
-            # 确保 example 是正确的格式
-            if isinstance(example, list):
-                example = example[0]
-                
+            rng_key = jax.random.PRNGKey(seed)
             result = model_runner.run_inference(example, rng_key)
             
-            # 检查结果中的数值
-            def check_and_fix_nans(x):
-                if isinstance(x, (np.ndarray, jnp.ndarray)):
-                    # 替换 NaN/inf 值为 0
-                    if np.any(np.isnan(x)) or np.any(np.isinf(x)):
-                        print(f"Warning: Found NaN/inf values in array of shape {x.shape}")
-                        x = np.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
-                return x
-            
-            # 递归处理所有数组
-            result = jax.tree_map(check_and_fix_nans, result)
-            
-            print(
-                f'Running model inference with seed {seed} took'
-                f' {time.time() - inference_start_time:.2f} seconds.'
+            inference_results = model_runner.extract_structures(
+                batch=example, result=result, target_name=fold_input.name
             )
-            print(f'Extracting output structure samples with seed {seed}...')
-            extract_structures = time.time()
             
-            try:
-                inference_results = model_runner.extract_structures(
-                    batch=example, result=result, target_name=fold_input.name
-                )
-                
-                # 验证结构结果
-                for res in inference_results:
-                    if not hasattr(res, 'positions') or res.positions is None:
-                        raise ValueError("Invalid structure result: missing positions")
-                    if np.any(np.isnan(res.positions)) or np.any(np.isinf(res.positions)):
-                        raise ValueError("Invalid structure result: NaN/inf in positions")
-                
-                print(
-                    f'Extracting {len(inference_results)} output structure samples with'
-                    f' seed {seed} took {time.time() - extract_structures:.2f} seconds.'
-                )
+            embeddings = model_runner.extract_embeddings(result)
 
-                embeddings = model_runner.extract_embeddings(result)
-
-                all_inference_results.append(
-                    ResultsForSeed(
-                        seed=seed,
-                        inference_results=inference_results,
-                        full_fold_input=fold_input,
-                        embeddings=embeddings,
-                    )
+            all_inference_results.append(
+                ResultsForSeed(
+                    seed=seed,
+                    inference_results=inference_results,
+                    full_fold_input=fold_input,
+                    embeddings=embeddings,
                 )
-            except Exception as e:
-                print(f"Error in structure extraction: {str(e)}")
-                print("Detailed error information:")
-                import traceback
-                traceback.print_exc()
-                continue
-                
+            )
         except Exception as e:
-            print(f'Error processing seed {seed}: {str(e)}')
-            print('Error details:', e.__class__.__name__)
-            import traceback
-            traceback.print_exc()
+            print(f"Error processing seed {seed}: {e}")
             continue
-        
-    print(
-        'Running model inference and extracting output structures with'
-        f' {len(fold_input.rng_seeds)} seed(s) took'
-        f' {time.time() - all_inference_start_time:.2f} seconds.'
-    )
-    
+
     if not all_inference_results:
-        raise ValueError('No valid predictions were generated for any seed.')
-    
+        raise ValueError("No valid predictions were generated")
+
     return all_inference_results
 
 
