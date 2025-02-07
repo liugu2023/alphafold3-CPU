@@ -272,154 +272,140 @@ _SAVE_EMBEDDINGS = flags.DEFINE_bool(
 )
 
 
-def make_model_config(
-    *,
-    flash_attention_implementation: attention.Implementation = 'xla',
-    num_diffusion_samples: int = 5,
-    num_recycles: int = 10,
-    return_embeddings: bool = False,
-) -> model.Model.Config:
-    """返回模型配置，针对 CPU 优化"""
-    config = model.Model.Config()
-    
-    # 性能优化配置
-    config.global_config.flash_attention_implementation = 'xla'
-    config.global_config.deterministic = False
-    config.global_config.subbatch_size = 8  # 增加子批次大小
-    config.global_config.precision = jnp.float32
-    
-    # 内存优化
-    config.global_config.max_cache_size = 2048  # 增加缓存大小
-    config.global_config.garbage_collection_interval = 50  # 更频繁的GC
-    
-    # 计算优化
-    config.global_config.parallel_compute = True  # 启用并行计算
-    config.global_config.remat = True  # 启用梯度检查点
-    config.global_config.scan_layers = True  # 使用scan优化循环
-    
-    return config
+def profile_time(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        start = time.time()
+        result = func(*args, **kwargs)
+        duration = time.time() - start
+        print(f"{func.__name__} took {duration:.2f} seconds")
+        return result
+    return wrapper
 
 
 class ModelRunner:
-  """Helper class to run structure prediction stages."""
+    """Helper class to run structure prediction stages."""
 
-  def __init__(
-      self,
-      config: model.Model.Config,
-      device: jax.Device,
-      model_dir: pathlib.Path,
-  ):
-    self._model_config = config
-    self._device = device
-    self._model_dir = model_dir
-    self._cache = {}
-    self._max_cache_size = 1000
+    def __init__(
+        self,
+        config: model.Model.Config,
+        device: jax.Device,
+        model_dir: pathlib.Path,
+    ):
+        self._model_config = config
+        self._device = device
+        self._model_dir = model_dir
+        self._cache = {}
+        self._max_cache_size = 1000
 
-  @functools.cached_property
-  def model_params(self) -> hk.Params:
-    """Loads model parameters from the model directory."""
-    return params.get_model_haiku_params(model_dir=self._model_dir)
+    @functools.cached_property
+    def model_params(self) -> hk.Params:
+        """Loads model parameters from the model directory."""
+        return params.get_model_haiku_params(model_dir=self._model_dir)
 
-  @functools.cached_property
-  def _model(
-      self,
-  ) -> Callable[[jnp.ndarray, features.BatchDict], model.ModelResult]:
-    """Loads model parameters and returns a jitted model forward pass."""
+    @functools.cached_property
+    def _model(
+        self,
+    ) -> Callable[[jnp.ndarray, features.BatchDict], model.ModelResult]:
+        """Loads model parameters and returns a jitted model forward pass."""
 
-    @hk.transform
-    def forward_fn(batch):
-      return model.Model(self._model_config)(batch)
+        @hk.transform
+        def forward_fn(batch):
+            return model.Model(self._model_config)(batch)
 
-    return functools.partial(
-        jax.jit(forward_fn.apply, device=self._device), self.model_params
-    )
-
-  def _get_cached_result(self, key):
-    return self._cache.get(key)
-        
-  def _cache_result(self, key, value):
-    if len(self._cache) > self._max_cache_size:
-        self._cache.pop(next(iter(self._cache)))
-    self._cache[key] = value
-
-  @profile_time
-  def run_inference(
-      self, featurised_example: features.BatchDict, rng_key: jnp.ndarray
-  ) -> model.ModelResult:
-    """Computes a forward pass of the model on a featurised example."""
-    # 添加预处理优化
-    featurised_example = self._preprocess_features(featurised_example)
-    
-    # 使用 jax.block_until_ready 确保计算完成
-    result = self._model(rng_key, featurised_example)
-    result = jax.block_until_ready(result)
-    
-    # 优化数据类型转换
-    result = jax.tree.map(
-        lambda x: x.astype(jnp.float32) if hasattr(x, 'astype') else x,
-        result
-    )
-    
-    return result
-
-  def _preprocess_features(self, features):
-    """优化特征预处理"""
-    # 使用 jax.vmap 进行批处理
-    features = jax.vmap(self._normalize_features)(features)
-    return features
-
-  def extract_structures(
-      self,
-      batch: features.BatchDict,
-      result: model.ModelResult,
-      target_name: str,
-  ) -> list[model.InferenceResult]:
-    """Generates structures from model outputs."""
-    return list(
-        model.Model.get_inference_result(
-            batch=batch, result=result, target_name=target_name
+        return functools.partial(
+            jax.jit(forward_fn.apply, device=self._device), self.model_params
         )
-    )
 
-  def extract_embeddings(
-      self,
-      result: model.ModelResult,
-  ) -> dict[str, np.ndarray] | None:
-    """Extracts embeddings from model outputs."""
-    embeddings = {}
-    if 'single_embeddings' in result:
-      embeddings['single_embeddings'] = result['single_embeddings']
-    if 'pair_embeddings' in result:
-      embeddings['pair_embeddings'] = result['pair_embeddings']
-    return embeddings or None
+    def _get_cached_result(self, key):
+        return self._cache.get(key)
+        
+    def _cache_result(self, key, value):
+        if len(self._cache) > self._max_cache_size:
+            self._cache.pop(next(iter(self._cache)))
+        self._cache[key] = value
 
-  def run_inference_with_retry(self, *args, max_retries=3, **kwargs):
-    for attempt in range(max_retries):
-      try:
-        return self.run_inference(*args, **kwargs)
-      except Exception as e:
-        if attempt == max_retries - 1:
-          raise
-        print(f"Retry {attempt + 1}/{max_retries} due to: {e}")
-        time.sleep(1)
+    @profile_time
+    def run_inference(
+        self, featurised_example: features.BatchDict, rng_key: jnp.ndarray
+    ) -> model.ModelResult:
+        """Computes a forward pass of the model on a featurised example."""
+        featurised_example = jax.device_put(
+            jax.tree_util.tree_map(
+                jnp.asarray, utils.remove_invalidly_typed_feats(featurised_example)
+            ),
+            self._device,
+        )
+
+        result = self._model(rng_key, featurised_example)
+        result = jax.tree.map(np.asarray, result)
+        result = jax.tree.map(
+            lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x,
+            result,
+        )
+        result = dict(result)
+        identifier = self.model_params['__meta__']['__identifier__'].tobytes()
+        result['__identifier__'] = identifier
+        return result
+
+    def _preprocess_features(self, features):
+        """优化特征预处理"""
+        # 使用 jax.vmap 进行批处理
+        features = jax.vmap(self._normalize_features)(features)
+        return features
+
+    def extract_structures(
+        self,
+        batch: features.BatchDict,
+        result: model.ModelResult,
+        target_name: str,
+    ) -> list[model.InferenceResult]:
+        """Generates structures from model outputs."""
+        return list(
+            model.Model.get_inference_result(
+                batch=batch, result=result, target_name=target_name
+            )
+        )
+
+    def extract_embeddings(
+        self,
+        result: model.ModelResult,
+    ) -> dict[str, np.ndarray] | None:
+        """Extracts embeddings from model outputs."""
+        embeddings = {}
+        if 'single_embeddings' in result:
+            embeddings['single_embeddings'] = result['single_embeddings']
+        if 'pair_embeddings' in result:
+            embeddings['pair_embeddings'] = result['pair_embeddings']
+        return embeddings or None
+
+    def run_inference_with_retry(self, *args, max_retries=3, **kwargs):
+        for attempt in range(max_retries):
+            try:
+                return self.run_inference(*args, **kwargs)
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    raise
+                print(f"Retry {attempt + 1}/{max_retries} due to: {e}")
+                time.sleep(1)
 
 
 @dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
 class ResultsForSeed:
-  """Stores the inference results (diffusion samples) for a single seed.
+    """Stores the inference results (diffusion samples) for a single seed.
 
-  Attributes:
-    seed: The seed used to generate the samples.
-    inference_results: The inference results, one per sample.
-    full_fold_input: The fold input that must also include the results of
-      running the data pipeline - MSA and templates.
-    embeddings: The final trunk single and pair embeddings, if requested.
-  """
+    Attributes:
+        seed: The seed used to generate the samples.
+        inference_results: The inference results, one per sample.
+        full_fold_input: The fold input that must also include the results of
+            running the data pipeline - MSA and templates.
+        embeddings: The final trunk single and pair embeddings, if requested.
+    """
 
-  seed: int
-  inference_results: Sequence[model.InferenceResult]
-  full_fold_input: folding_input.Input
-  embeddings: dict[str, np.ndarray] | None = None
+    seed: int
+    inference_results: Sequence[model.InferenceResult]
+    full_fold_input: folding_input.Input
+    embeddings: dict[str, np.ndarray] | None = None
 
 
 def predict_structure(
@@ -509,12 +495,12 @@ def write_fold_input_json(
     fold_input: folding_input.Input,
     output_dir: os.PathLike[str] | str,
 ) -> None:
-  """Writes the input JSON to the output directory."""
-  os.makedirs(output_dir, exist_ok=True)
-  path = os.path.join(output_dir, f'{fold_input.sanitised_name()}_data.json')
-  print(f'Writing model input JSON to {path}')
-  with open(path, 'wt') as f:
-    f.write(fold_input.to_json())
+    """Writes the input JSON to the output directory."""
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, f'{fold_input.sanitised_name()}_data.json')
+    print(f'Writing model input JSON to {path}')
+    with open(path, 'wt') as f:
+        f.write(fold_input.to_json())
 
 
 def write_outputs(
@@ -522,51 +508,51 @@ def write_outputs(
     output_dir: os.PathLike[str] | str,
     job_name: str,
 ) -> None:
-  """Writes outputs to the specified output directory."""
-  ranking_scores = []
-  max_ranking_score = None
-  max_ranking_result = None
+    """Writes outputs to the specified output directory."""
+    ranking_scores = []
+    max_ranking_score = None
+    max_ranking_result = None
 
-  output_terms = (
-      pathlib.Path(alphafold3.cpp.__file__).parent / 'OUTPUT_TERMS_OF_USE.md'
-  ).read_text()
+    output_terms = (
+        pathlib.Path(alphafold3.cpp.__file__).parent / 'OUTPUT_TERMS_OF_USE.md'
+    ).read_text()
 
-  os.makedirs(output_dir, exist_ok=True)
-  for results_for_seed in all_inference_results:
-    seed = results_for_seed.seed
-    for sample_idx, result in enumerate(results_for_seed.inference_results):
-      sample_dir = os.path.join(output_dir, f'seed-{seed}_sample-{sample_idx}')
-      os.makedirs(sample_dir, exist_ok=True)
-      post_processing.write_output(
-          inference_result=result, output_dir=sample_dir
-      )
-      ranking_score = float(result.metadata['ranking_score'])
-      ranking_scores.append((seed, sample_idx, ranking_score))
-      if max_ranking_score is None or ranking_score > max_ranking_score:
-        max_ranking_score = ranking_score
-        max_ranking_result = result
+    os.makedirs(output_dir, exist_ok=True)
+    for results_for_seed in all_inference_results:
+        seed = results_for_seed.seed
+        for sample_idx, result in enumerate(results_for_seed.inference_results):
+            sample_dir = os.path.join(output_dir, f'seed-{seed}_sample-{sample_idx}')
+            os.makedirs(sample_dir, exist_ok=True)
+            post_processing.write_output(
+                inference_result=result, output_dir=sample_dir
+            )
+            ranking_score = float(result.metadata['ranking_score'])
+            ranking_scores.append((seed, sample_idx, ranking_score))
+            if max_ranking_score is None or ranking_score > max_ranking_score:
+                max_ranking_score = ranking_score
+                max_ranking_result = result
 
-    if embeddings := results_for_seed.embeddings:
-      embeddings_dir = os.path.join(output_dir, f'seed-{seed}_embeddings')
-      os.makedirs(embeddings_dir, exist_ok=True)
-      post_processing.write_embeddings(
-          embeddings=embeddings, output_dir=embeddings_dir
-      )
+        if embeddings := results_for_seed.embeddings:
+            embeddings_dir = os.path.join(output_dir, f'seed-{seed}_embeddings')
+            os.makedirs(embeddings_dir, exist_ok=True)
+            post_processing.write_embeddings(
+                embeddings=embeddings, output_dir=embeddings_dir
+            )
 
-  if max_ranking_result is not None:  # True iff ranking_scores non-empty.
-    post_processing.write_output(
-        inference_result=max_ranking_result,
-        output_dir=output_dir,
-        # The output terms of use are the same for all seeds/samples.
-        terms_of_use=output_terms,
-        name=job_name,
-    )
-    # Save csv of ranking scores with seeds and sample indices, to allow easier
-    # comparison of ranking scores across different runs.
-    with open(os.path.join(output_dir, 'ranking_scores.csv'), 'wt') as f:
-      writer = csv.writer(f)
-      writer.writerow(['seed', 'sample', 'ranking_score'])
-      writer.writerows(ranking_scores)
+    if max_ranking_result is not None:  # True iff ranking_scores non-empty.
+        post_processing.write_output(
+            inference_result=max_ranking_result,
+            output_dir=output_dir,
+            # The output terms of use are the same for all seeds/samples.
+            terms_of_use=output_terms,
+            name=job_name,
+        )
+        # Save csv of ranking scores with seeds and sample indices, to allow easier
+        # comparison of ranking scores across different runs.
+        with open(os.path.join(output_dir, 'ranking_scores.csv'), 'wt') as f:
+            writer = csv.writer(f)
+            writer.writerow(['seed', 'sample', 'ranking_score'])
+            writer.writerows(ranking_scores)
 
 
 @overload
@@ -577,7 +563,7 @@ def process_fold_input(
     output_dir: os.PathLike[str] | str,
     buckets: Sequence[int] | None = None,
 ) -> folding_input.Input:
-  ...
+    ...
 
 
 @overload
@@ -588,23 +574,23 @@ def process_fold_input(
     output_dir: os.PathLike[str] | str,
     buckets: Sequence[int] | None = None,
 ) -> Sequence[ResultsForSeed]:
-  ...
+    ...
 
 
 def replace_db_dir(path_with_db_dir: str, db_dirs: Sequence[str]) -> str:
-  """Replaces the DB_DIR placeholder in a path with the given DB_DIR."""
-  template = string.Template(path_with_db_dir)
-  if 'DB_DIR' in template.get_identifiers():
-    for db_dir in db_dirs:
-      path = template.substitute(DB_DIR=db_dir)
-      if os.path.exists(path):
-        return path
-    raise FileNotFoundError(
-        f'{path_with_db_dir} with ${{DB_DIR}} not found in any of {db_dirs}.'
-    )
-  if not os.path.exists(path_with_db_dir):
-    raise FileNotFoundError(f'{path_with_db_dir} does not exist.')
-  return path_with_db_dir
+    """Replaces the DB_DIR placeholder in a path with the given DB_DIR."""
+    template = string.Template(path_with_db_dir)
+    if 'DB_DIR' in template.get_identifiers():
+        for db_dir in db_dirs:
+            path = template.substitute(DB_DIR=db_dir)
+            if os.path.exists(path):
+                return path
+        raise FileNotFoundError(
+            f'{path_with_db_dir} with ${{DB_DIR}} not found in any of {db_dirs}.'
+        )
+    if not os.path.exists(path_with_db_dir):
+        raise FileNotFoundError(f'{path_with_db_dir} does not exist.')
+    return path_with_db_dir
 
 
 def process_fold_input(
@@ -615,203 +601,220 @@ def process_fold_input(
     buckets: Sequence[int] | None = None,
     conformer_max_iterations: int | None = None,
 ) -> folding_input.Input | Sequence[ResultsForSeed]:
-  """Runs data pipeline and/or inference on a single fold input.
+    """Runs data pipeline and/or inference on a single fold input.
 
-  Args:
-    fold_input: Fold input to process.
-    data_pipeline_config: Data pipeline config to use. If None, skip the data
-      pipeline.
-    model_runner: Model runner to use. If None, skip inference.
-    output_dir: Output directory to write to.
-    buckets: Bucket sizes to pad the data to, to avoid excessive re-compilation
-      of the model. If None, calculate the appropriate bucket size from the
-      number of tokens. If not None, must be a sequence of at least one integer,
-      in strictly increasing order. Will raise an error if the number of tokens
-      is more than the largest bucket size.
-    conformer_max_iterations: Optional override for maximum number of iterations
-      to run for RDKit conformer search.
+    Args:
+        fold_input: Fold input to process.
+        data_pipeline_config: Data pipeline config to use. If None, skip the data
+            pipeline.
+        model_runner: Model runner to use. If None, skip inference.
+        output_dir: Output directory to write to.
+        buckets: Bucket sizes to pad the data to, to avoid excessive re-compilation
+            of the model. If None, calculate the appropriate bucket size from the
+            number of tokens. If not None, must be a sequence of at least one integer,
+            in strictly increasing order. Will raise an error if the number of tokens
+            is more than the largest bucket size.
+        conformer_max_iterations: Optional override for maximum number of iterations
+            to run for RDKit conformer search.
 
-  Returns:
-    The processed fold input, or the inference results for each seed.
+    Returns:
+        The processed fold input, or the inference results for each seed.
 
-  Raises:
-    ValueError: If the fold input has no chains.
-  """
-  print(f'\nRunning fold job {fold_input.name}...')
+    Raises:
+        ValueError: If the fold input has no chains.
+    """
+    print(f'\nRunning fold job {fold_input.name}...')
 
-  if not fold_input.chains:
-    raise ValueError('Fold input has no chains.')
+    if not fold_input.chains:
+        raise ValueError('Fold input has no chains.')
 
-  if os.path.exists(output_dir) and os.listdir(output_dir):
-    new_output_dir = (
-        f'{output_dir}_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}'
-    )
-    print(
-        f'Output will be written in {new_output_dir} since {output_dir} is'
-        ' non-empty.'
-    )
-    output_dir = new_output_dir
-  else:
-    print(f'Output will be written in {output_dir}')
+    if os.path.exists(output_dir) and os.listdir(output_dir):
+        new_output_dir = (
+            f'{output_dir}_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}'
+        )
+        print(
+            f'Output will be written in {new_output_dir} since {output_dir} is'
+            ' non-empty.'
+        )
+        output_dir = new_output_dir
+    else:
+        print(f'Output will be written in {output_dir}')
 
-  if data_pipeline_config is None:
-    print('Skipping data pipeline...')
-  else:
-    print('Running data pipeline...')
-    fold_input = pipeline.DataPipeline(data_pipeline_config).process(fold_input)
+    if data_pipeline_config is None:
+        print('Skipping data pipeline...')
+    else:
+        print('Running data pipeline...')
+        fold_input = pipeline.DataPipeline(data_pipeline_config).process(fold_input)
 
-  write_fold_input_json(fold_input, output_dir)
-  if model_runner is None:
-    print('Skipping model inference...')
-    output = fold_input
-  else:
-    print(
-        f'Predicting 3D structure for {fold_input.name} with'
-        f' {len(fold_input.rng_seeds)} seed(s)...'
-    )
-    all_inference_results = predict_structure(
-        fold_input=fold_input,
-        model_runner=model_runner,
-        buckets=buckets,
-        conformer_max_iterations=conformer_max_iterations,
-    )
-    print(f'Writing outputs with {len(fold_input.rng_seeds)} seed(s)...')
-    write_outputs(
-        all_inference_results=all_inference_results,
-        output_dir=output_dir,
-        job_name=fold_input.sanitised_name(),
-    )
-    output = all_inference_results
+    write_fold_input_json(fold_input, output_dir)
+    if model_runner is None:
+        print('Skipping model inference...')
+        output = fold_input
+    else:
+        print(
+            f'Predicting 3D structure for {fold_input.name} with'
+            f' {len(fold_input.rng_seeds)} seed(s)...'
+        )
+        all_inference_results = predict_structure(
+            fold_input=fold_input,
+            model_runner=model_runner,
+            buckets=buckets,
+            conformer_max_iterations=conformer_max_iterations,
+        )
+        print(f'Writing outputs with {len(fold_input.rng_seeds)} seed(s)...')
+        write_outputs(
+            all_inference_results=all_inference_results,
+            output_dir=output_dir,
+            job_name=fold_input.sanitised_name(),
+        )
+        output = all_inference_results
 
-  print(f'Fold job {fold_input.name} done.\n')
-  return output
+    print(f'Fold job {fold_input.name} done.\n')
+    return output
 
 
-def profile_time(func):
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        start = time.time()
-        result = func(*args, **kwargs)
-        duration = time.time() - start
-        print(f"{func.__name__} took {duration:.2f} seconds")
-        return result
-    return wrapper
+def make_model_config(
+    *,
+    flash_attention_implementation: attention.Implementation = 'xla',
+    num_diffusion_samples: int = 5,
+    num_recycles: int = 10,
+    return_embeddings: bool = False,
+) -> model.Model.Config:
+    """返回模型配置，针对 CPU 优化"""
+    config = model.Model.Config()
+    
+    # 性能优化配置
+    config.global_config.flash_attention_implementation = 'xla'
+    config.global_config.deterministic = False
+    config.global_config.subbatch_size = 8  # 增加子批次大小
+    config.global_config.precision = jnp.float32
+    
+    # 内存优化
+    config.global_config.max_cache_size = 2048  # 增加缓存大小
+    config.global_config.garbage_collection_interval = 50  # 更频繁的GC
+    
+    # 计算优化
+    config.global_config.parallel_compute = True  # 启用并行计算
+    config.global_config.remat = True  # 启用梯度检查点
+    config.global_config.scan_layers = True  # 使用scan优化循环
+    
+    return config
 
 
 def main(_):
-  # 添加 JAX 优化配置
-  jax.config.update('jax_enable_x64', False)  # 使用 float32 而不是 float64
-  jax.config.update('jax_disable_jit', False)  # 确保启用 JIT
-  jax.config.update('jax_platform_name', 'cpu')  # 明确使用 CPU
-  
-  if _JAX_COMPILATION_CACHE_DIR.value is not None:
-    jax.config.update(
-        'jax_compilation_cache_dir', _JAX_COMPILATION_CACHE_DIR.value
-    )
-
-  if _JSON_PATH.value is None == _INPUT_DIR.value is None:
-    raise ValueError(
-        'Exactly one of --json_path or --input_dir must be specified.'
-    )
-
-  if not _RUN_INFERENCE.value and not _RUN_DATA_PIPELINE.value:
-    raise ValueError(
-        'At least one of --run_inference or --run_data_pipeline must be'
-        ' set to true.'
-    )
-
-  if _INPUT_DIR.value is not None:
-    fold_inputs = folding_input.load_fold_inputs_from_dir(
-        pathlib.Path(_INPUT_DIR.value)
-    )
-  elif _JSON_PATH.value is not None:
-    fold_inputs = folding_input.load_fold_inputs_from_path(
-        pathlib.Path(_JSON_PATH.value)
-    )
-  else:
-    raise AssertionError(
-        'Exactly one of --json_path or --input_dir must be specified.'
-    )
-
-  try:
-    os.makedirs(_OUTPUT_DIR.value, exist_ok=True)
-  except OSError as e:
-    print(f'Failed to create output directory {_OUTPUT_DIR.value}: {e}')
-    raise
-
-  if _RUN_INFERENCE.value:
-    # 直接使用 CPU 设备
-    device = jax.devices('cpu')[0]
-    print(f'Using CPU device: {device}')
+    # 添加 JAX 优化配置
+    jax.config.update('jax_enable_x64', False)  # 使用 float32 而不是 float64
+    jax.config.update('jax_disable_jit', False)  # 确保启用 JIT
+    jax.config.update('jax_platform_name', 'cpu')  # 明确使用 CPU
     
-    print('Building model from scratch...')
-    model_runner = ModelRunner(
-        config=make_model_config(
-            flash_attention_implementation=_FLASH_ATTENTION_IMPLEMENTATION.value,
-            num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
-            num_recycles=_NUM_RECYCLES.value,
-            return_embeddings=_SAVE_EMBEDDINGS.value,
-        ),
-        device=device,
-        model_dir=pathlib.Path(MODEL_DIR.value),
-    )
-    print('Checking we can load the model parameters...')
-    _ = model_runner.model_params
-  else:
-    model_runner = None
+    if _JAX_COMPILATION_CACHE_DIR.value is not None:
+        jax.config.update(
+            'jax_compilation_cache_dir', _JAX_COMPILATION_CACHE_DIR.value
+        )
 
-  # 添加数据管道配置
-  if _RUN_DATA_PIPELINE.value:
-    data_pipeline_config = pipeline.DataPipelineConfig(
-        jackhmmer_binary_path=_JACKHMMER_BINARY_PATH.value,
-        nhmmer_binary_path=_NHMMER_BINARY_PATH.value,
-        hmmalign_binary_path=_HMMALIGN_BINARY_PATH.value,
-        hmmsearch_binary_path=_HMMSEARCH_BINARY_PATH.value,
-        hmmbuild_binary_path=_HMMBUILD_BINARY_PATH.value,
-        jackhmmer_n_cpu=_JACKHMMER_N_CPU.value,
-        nhmmer_n_cpu=_NHMMER_N_CPU.value,
-        small_bfd_database_path=replace_db_dir(
-            _SMALL_BFD_DATABASE_PATH.value, DB_DIR.value),
-        mgnify_database_path=replace_db_dir(
-            _MGNIFY_DATABASE_PATH.value, DB_DIR.value),
-        uniprot_cluster_annot_database_path=replace_db_dir(
-            _UNIPROT_CLUSTER_ANNOT_DATABASE_PATH.value, DB_DIR.value),
-        uniref90_database_path=replace_db_dir(
-            _UNIREF90_DATABASE_PATH.value, DB_DIR.value),
-        ntrna_database_path=replace_db_dir(
-            _NTRNA_DATABASE_PATH.value, DB_DIR.value),
-        rfam_database_path=replace_db_dir(
-            _RFAM_DATABASE_PATH.value, DB_DIR.value),
-        rna_central_database_path=replace_db_dir(
-            _RNA_CENTRAL_DATABASE_PATH.value, DB_DIR.value),
-        pdb_database_path=replace_db_dir(
-            _PDB_DATABASE_PATH.value, DB_DIR.value),
-        seqres_database_path=replace_db_dir(
-            _SEQRES_DATABASE_PATH.value, DB_DIR.value),
-        max_template_date=datetime.datetime.strptime(
-            _MAX_TEMPLATE_DATE.value, '%Y-%m-%d'),
-    )
-  else:
-    data_pipeline_config = None
+    if _JSON_PATH.value is None == _INPUT_DIR.value is None:
+        raise ValueError(
+            'Exactly one of --json_path or --input_dir must be specified.'
+        )
 
-  num_fold_inputs = 0
-  for fold_input in fold_inputs:
-    if _NUM_SEEDS.value is not None:
-      print(f'Expanding fold job {fold_input.name} to {_NUM_SEEDS.value} seeds')
-      fold_input = fold_input.with_multiple_seeds(_NUM_SEEDS.value)
-    process_fold_input(
-        fold_input=fold_input,
-        data_pipeline_config=data_pipeline_config,
-        model_runner=model_runner,
-        output_dir=os.path.join(_OUTPUT_DIR.value, fold_input.sanitised_name()),
-        buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
-        conformer_max_iterations=_CONFORMER_MAX_ITERATIONS.value,
-    )
-    num_fold_inputs += 1
+    if not _RUN_INFERENCE.value and not _RUN_DATA_PIPELINE.value:
+        raise ValueError(
+            'At least one of --run_inference or --run_data_pipeline must be'
+            ' set to true.'
+        )
 
-  print(f'Done running {num_fold_inputs} fold jobs.')
+    if _INPUT_DIR.value is not None:
+        fold_inputs = folding_input.load_fold_inputs_from_dir(
+            pathlib.Path(_INPUT_DIR.value)
+        )
+    elif _JSON_PATH.value is not None:
+        fold_inputs = folding_input.load_fold_inputs_from_path(
+            pathlib.Path(_JSON_PATH.value)
+        )
+    else:
+        raise AssertionError(
+            'Exactly one of --json_path or --input_dir must be specified.'
+        )
+
+    try:
+        os.makedirs(_OUTPUT_DIR.value, exist_ok=True)
+    except OSError as e:
+        print(f'Failed to create output directory {_OUTPUT_DIR.value}: {e}')
+        raise
+
+    if _RUN_INFERENCE.value:
+        # 直接使用 CPU 设备
+        device = jax.devices('cpu')[0]
+        print(f'Using CPU device: {device}')
+        
+        print('Building model from scratch...')
+        model_runner = ModelRunner(
+            config=make_model_config(
+                flash_attention_implementation=_FLASH_ATTENTION_IMPLEMENTATION.value,
+                num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
+                num_recycles=_NUM_RECYCLES.value,
+                return_embeddings=_SAVE_EMBEDDINGS.value,
+            ),
+            device=device,
+            model_dir=pathlib.Path(MODEL_DIR.value),
+        )
+        print('Checking we can load the model parameters...')
+        _ = model_runner.model_params
+    else:
+        model_runner = None
+
+    # 添加数据管道配置
+    if _RUN_DATA_PIPELINE.value:
+        data_pipeline_config = pipeline.DataPipelineConfig(
+            jackhmmer_binary_path=_JACKHMMER_BINARY_PATH.value,
+            nhmmer_binary_path=_NHMMER_BINARY_PATH.value,
+            hmmalign_binary_path=_HMMALIGN_BINARY_PATH.value,
+            hmmsearch_binary_path=_HMMSEARCH_BINARY_PATH.value,
+            hmmbuild_binary_path=_HMMBUILD_BINARY_PATH.value,
+            jackhmmer_n_cpu=_JACKHMMER_N_CPU.value,
+            nhmmer_n_cpu=_NHMMER_N_CPU.value,
+            small_bfd_database_path=replace_db_dir(
+                _SMALL_BFD_DATABASE_PATH.value, DB_DIR.value),
+            mgnify_database_path=replace_db_dir(
+                _MGNIFY_DATABASE_PATH.value, DB_DIR.value),
+            uniprot_cluster_annot_database_path=replace_db_dir(
+                _UNIPROT_CLUSTER_ANNOT_DATABASE_PATH.value, DB_DIR.value),
+            uniref90_database_path=replace_db_dir(
+                _UNIREF90_DATABASE_PATH.value, DB_DIR.value),
+            ntrna_database_path=replace_db_dir(
+                _NTRNA_DATABASE_PATH.value, DB_DIR.value),
+            rfam_database_path=replace_db_dir(
+                _RFAM_DATABASE_PATH.value, DB_DIR.value),
+            rna_central_database_path=replace_db_dir(
+                _RNA_CENTRAL_DATABASE_PATH.value, DB_DIR.value),
+            pdb_database_path=replace_db_dir(
+                _PDB_DATABASE_PATH.value, DB_DIR.value),
+            seqres_database_path=replace_db_dir(
+                _SEQRES_DATABASE_PATH.value, DB_DIR.value),
+            max_template_date=datetime.datetime.strptime(
+                _MAX_TEMPLATE_DATE.value, '%Y-%m-%d'),
+        )
+    else:
+        data_pipeline_config = None
+
+    num_fold_inputs = 0
+    for fold_input in fold_inputs:
+        if _NUM_SEEDS.value is not None:
+            print(f'Expanding fold job {fold_input.name} to {_NUM_SEEDS.value} seeds')
+            fold_input = fold_input.with_multiple_seeds(_NUM_SEEDS.value)
+        process_fold_input(
+            fold_input=fold_input,
+            data_pipeline_config=data_pipeline_config,
+            model_runner=model_runner,
+            output_dir=os.path.join(_OUTPUT_DIR.value, fold_input.sanitised_name()),
+            buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
+            conformer_max_iterations=_CONFORMER_MAX_ITERATIONS.value,
+        )
+        num_fold_inputs += 1
+
+    print(f'Done running {num_fold_inputs} fold jobs.')
 
 
 if __name__ == '__main__':
-  flags.mark_flags_as_required(['output_dir'])
-  app.run(main)
+    flags.mark_flags_as_required(['output_dir'])
+    app.run(main)
