@@ -343,6 +343,10 @@ class ModelRunner:
                 x = np.clip(x, -1e6, 1e6)
             return x
             
+        # 确保输入格式正确
+        if isinstance(featurised_example, list):
+            featurised_example = featurised_example[0]
+        
         featurised_example = jax.tree_util.tree_map(
             preprocess_features,
             featurised_example
@@ -358,8 +362,12 @@ class ModelRunner:
         )
 
         # 运行模型推理
-        result = self._model(rng_key, featurised_example)
-        
+        try:
+            result = self._model(rng_key, featurised_example)
+        except Exception as e:
+            print(f"Error in model inference: {e}")
+            raise
+
         # 后处理结果
         def postprocess_result(x):
             if isinstance(x, (np.ndarray, jnp.ndarray)):
@@ -490,6 +498,9 @@ def predict_structure(
                 verbose=True,
                 conformer_max_iterations=conformer_max_iterations,
             )
+            # 确保示例是正确的格式
+            if isinstance(example, list):
+                example = example[0]
             featurised_examples.append(example)
         except Exception as e:
             print(f"Error in featurisation for seed {seed}: {e}")
@@ -507,12 +518,22 @@ def predict_structure(
         print(f'Running model inference with seed {seed}...')
         try:
             rng_key = jax.random.PRNGKey(seed)
+            
+            # 确保示例是字典格式
+            if not isinstance(example, dict):
+                print(f"Warning: Example for seed {seed} is not a dictionary, skipping")
+                continue
+                
             result = model_runner.run_inference(example, rng_key)
             
             inference_results = model_runner.extract_structures(
                 batch=example, result=result, target_name=fold_input.name
             )
             
+            if not inference_results:
+                print(f"Warning: No valid structures generated for seed {seed}")
+                continue
+                
             embeddings = model_runner.extract_embeddings(result)
 
             all_inference_results.append(
@@ -525,6 +546,8 @@ def predict_structure(
             )
         except Exception as e:
             print(f"Error processing seed {seed}: {e}")
+            import traceback
+            traceback.print_exc()
             continue
 
     if not all_inference_results:
