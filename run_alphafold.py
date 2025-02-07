@@ -675,6 +675,34 @@ def main(_):
     devices = jax.local_devices(backend='cpu')
     print(f'Using CPU device: {devices[0]}')
 
+    # 添加data_pipeline_config的定义
+    if _RUN_DATA_PIPELINE.value:
+      expand_path = lambda x: replace_db_dir(x, DB_DIR.value)
+      max_template_date = datetime.date.fromisoformat(_MAX_TEMPLATE_DATE.value)
+      data_pipeline_config = pipeline.DataPipelineConfig(
+          jackhmmer_binary_path=_JACKHMMER_BINARY_PATH.value,
+          nhmmer_binary_path=_NHMMER_BINARY_PATH.value,
+          hmmalign_binary_path=_HMMALIGN_BINARY_PATH.value,
+          hmmsearch_binary_path=_HMMSEARCH_BINARY_PATH.value,
+          hmmbuild_binary_path=_HMMBUILD_BINARY_PATH.value,
+          small_bfd_database_path=expand_path(_SMALL_BFD_DATABASE_PATH.value),
+          mgnify_database_path=expand_path(_MGNIFY_DATABASE_PATH.value),
+          uniprot_cluster_annot_database_path=expand_path(
+              _UNIPROT_CLUSTER_ANNOT_DATABASE_PATH.value
+          ),
+          uniref90_database_path=expand_path(_UNIREF90_DATABASE_PATH.value),
+          ntrna_database_path=expand_path(_NTRNA_DATABASE_PATH.value),
+          rfam_database_path=expand_path(_RFAM_DATABASE_PATH.value),
+          rna_central_database_path=expand_path(_RNA_CENTRAL_DATABASE_PATH.value),
+          pdb_database_path=expand_path(_PDB_DATABASE_PATH.value),
+          seqres_database_path=expand_path(_SEQRES_DATABASE_PATH.value),
+          jackhmmer_n_cpu=_JACKHMMER_N_CPU.value,
+          nhmmer_n_cpu=_NHMMER_N_CPU.value,
+          max_template_date=max_template_date,
+      )
+    else:
+      data_pipeline_config = None
+
     print('Building model from scratch...')
     model_runner = ModelRunner(
         config=make_model_config(
