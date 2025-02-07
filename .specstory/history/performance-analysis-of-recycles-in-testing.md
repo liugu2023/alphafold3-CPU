@@ -912,6 +912,243 @@ _**Assistant**_
 
 
 
+看起来是装饰器定义的位置有问题。让我们修改 `run_alphafold.py` 的代码结构：
+
+```python:run_alphafold.py
+# ... 其他导入 ...
+
+# 将装饰器定义移到类定义之前
+def profile_time(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        start = time.time()
+        result = func(*args, **kwargs)
+        duration = time.time() - start
+        print(f"{func.__name__} took {duration:.2f} seconds")
+        return result
+    return wrapper
+
+
+class ModelRunner:
+    """Helper class to run structure prediction stages."""
+
+    def __init__(
+        self,
+        config: model.Model.Config,
+        device: jax.Device,
+        model_dir: pathlib.Path,
+    ):
+        self._model_config = config
+        self._device = device
+        self._model_dir = model_dir
+        self._cache = {}
+        self._max_cache_size = 1000
+
+    @functools.cached_property
+    def model_params(self) -> hk.Params:
+        """Loads model parameters from the model directory."""
+        return params.get_model_haiku_params(model_dir=self._model_dir)
+
+    @functools.cached_property
+    def _model(
+        self,
+    ) -> Callable[[jnp.ndarray, features.BatchDict], model.ModelResult]:
+        """Loads model parameters and returns a jitted model forward pass."""
+
+        @hk.transform
+        def forward_fn(batch):
+            return model.Model(self._model_config)(batch)
+
+        return functools.partial(
+            jax.jit(forward_fn.apply, device=self._device), self.model_params
+        )
+
+    @profile_time  # 现在可以使用装饰器
+    def run_inference(
+        self, featurised_example: features.BatchDict, rng_key: jnp.ndarray
+    ) -> model.ModelResult:
+        """Computes a forward pass of the model on a featurised example."""
+        featurised_example = jax.device_put(
+            jax.tree_util.tree_map(
+                jnp.asarray, utils.remove_invalidly_typed_feats(featurised_example)
+            ),
+            self._device,
+        )
+
+        result = self._model(rng_key, featurised_example)
+        result = jax.tree.map(np.asarray, result)
+        result = jax.tree.map(
+            lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x,
+            result,
+        )
+        result = dict(result)
+        identifier = self.model_params['__meta__']['__identifier__'].tobytes()
+        result['__identifier__'] = identifier
+        return result
+
+    # ... 其他方法 ...
+```
+
+主要修改：
+1. 将 `profile_time` 装饰器定义移到 `ModelRunner` 类定义之前
+2. 保持其他代码不变
+
+这样修改后，装饰器就可以正常工作了。让我们重新运行测试：
+
+```bash
+./test_performance.sh
+```
+
+需要我解释更多细节吗？或者您遇到了其他问题？
+
+---
+
+_**User**_
+
+(alphafold-CPU) liugu@login:~/alphafold3-CPU$ ./test_performance.sh 
+Created base directory: /archive/liugu/output/performance_test_20250207_152238
+Testing with num_recycles = 10
+Created output directory: /archive/liugu/output/performance_test_20250207_152238/recycles_10
+I0207 15:22:41.026814 140329269899968 xla_bridge.py:895] Unable to initialize backend 'rocm': module 'jaxlib.xla_extension' has no attribute 'GpuAllocatorConfig'
+I0207 15:22:41.029222 140329269899968 xla_bridge.py:895] Unable to initialize backend 'tpu': INTERNAL: Failed to open libtpu.so: libtpu.so: cannot open shared object file: No such file or directory
+I0207 15:22:43.341688 140329269899968 pipeline.py:474] Skipping MSA and template search for protein chain A because it already has MSAs and templates.
+Using CPU device: TFRT_CPU_0
+Building model from scratch...
+Checking we can load the model parameters...
+
+Running fold job 37aa_2JO9...
+Output will be written in /archive/liugu/output/performance_test_20250207_152238/recycles_10/37aa_2jo9
+Running data pipeline...
+Processing chain A
+Processing chain A took 0.00 seconds
+Writing model input JSON to /archive/liugu/output/performance_test_20250207_152238/recycles_10/37aa_2jo9/37aa_2jo9_data.json
+Predicting 3D structure for 37aa_2JO9 with 1 seed(s)...
+Featurising data with 1 seed(s)...
+/usr/lib/python3.11/multiprocessing/popen_fork.py:66: RuntimeWarning: os.fork() was called. os.fork() is incompatible with multithreaded code, and JAX is multithreaded, so this will likely lead to a deadlock.
+  self.pid = os.fork()
+Traceback (most recent call last):
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 820, in <module>
+    app.run(main)
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/absl/app.py", line 308, in run
+    _run_main(main, args)
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/absl/app.py", line 254, in _run_main
+    sys.exit(main(argv))
+             ^^^^^^^^^^
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 805, in main
+    process_fold_input(
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 658, in process_fold_input
+    all_inference_results = predict_structure(
+                            ^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 424, in predict_structure
+    partial(featurisation.featurise_input, 
+    ^^^^^^^
+NameError: name 'partial' is not defined
+Warning: Could not extract inference time for num_recycles=10
+Completed test with num_recycles = 10
+----------------------------------------
+
+Performance comparison:
+num_recycles=10: ERROR
+
+Test results are saved in: /archive/liugu/output/performance_test_20250207_152238
+
+---
+
+_**Assistant**_
+
+
+
+看起来有两个主要问题需要解决：
+
+1. `partial` 未定义的问题
+2. JAX 多线程与 `os.fork()` 的兼容性问题
+
+让我们修改 `run_alphafold.py`：
+
+```python:run_alphafold.py
+# 在文件开头添加导入
+from functools import partial  # 添加这行
+
+# ... 其他导入保持不变 ...
+
+def predict_structure(
+    fold_input: folding_input.Input,
+    model_runner: ModelRunner,
+    buckets: Sequence[int] | None = None,
+    conformer_max_iterations: int | None = None,
+) -> Sequence[ResultsForSeed]:
+    """Runs the full inference pipeline to predict structures for each seed."""
+
+    print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
+    featurisation_start_time = time.time()
+    ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
+    
+    # 修改为单线程处理，避免 fork 问题
+    featurised_examples = []
+    for chunk in fold_input.chunks:
+        example = featurisation.featurise_input(
+            fold_input=chunk,
+            buckets=buckets,
+            ccd=ccd,
+            verbose=False,
+            conformer_max_iterations=conformer_max_iterations
+        )
+        featurised_examples.append(example)
+    
+    print(
+        f'Featurising data with {len(fold_input.rng_seeds)} seed(s) took'
+        f' {time.time() - featurisation_start_time:.2f} seconds.'
+    )
+    
+    # ... 其余代码保持不变 ...
+```
+
+主要修改：
+1. 添加了 `partial` 的导入
+2. 将多进程特征处理改为单线程处理，避免 JAX 多线程与 `os.fork()` 的冲突
+
+另外，我们还需要确保正确设置内存限制。在 `predict_structure` 函数中，我们需要定义 `memory_limit`：
+
+```python:run_alphafold.py
+def predict_structure(...):
+    # ... 其他代码 ...
+    
+    # 设置合理的内存限制（比如 32GB）
+    memory_limit = 32 * 1024 * 1024 * 1024  # 32GB in bytes
+    
+    for seed, example in zip(fold_input.rng_seeds, featurised_examples):
+        try:
+            # 设置内存限制
+            resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
+            
+            # ... 其他代码 ...
+```
+
+让我们重新运行测试：
+```bash
+./test_performance.sh
+```
+
+这些修改应该能解决当前的错误。需要我解释更多细节吗？
+
+---
+
+_**User**_
+
+内存足够，不需要设置内存限制
+
+---
+
+_**Assistant**_
+
+好的，让我们移除内存限制相关的代码，并进一步优化性能：
+
+```python:run_alphafold.py
+def predict_structure(
+    fold_input: folding_input.Input,
+    model_runner: ModelRunner,
+    buckets:
+
 ---
 
 

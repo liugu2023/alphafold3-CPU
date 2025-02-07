@@ -35,6 +35,7 @@ import typing
 from typing import overload
 import resource
 import gc
+from functools import partial  # 添加这行
 
 from absl import app
 from absl import flags
@@ -419,13 +420,19 @@ def predict_structure(
     print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
     featurisation_start_time = time.time()
     ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
-    with multiprocessing.Pool() as pool:
-        featurised_examples = pool.map(
-            partial(featurisation.featurise_input, 
-                   buckets=buckets,
-                   verbose=False),
-            fold_input.chunks
+    
+    # 修改为单线程处理，避免 fork 问题
+    featurised_examples = []
+    for chunk in fold_input.chunks:
+        example = featurisation.featurise_input(
+            fold_input=chunk,
+            buckets=buckets,
+            ccd=ccd,
+            verbose=False,
+            conformer_max_iterations=conformer_max_iterations
         )
+        featurised_examples.append(example)
+    
     print(
         f'Featurising data with {len(fold_input.rng_seeds)} seed(s) took'
         f' {time.time() - featurisation_start_time:.2f} seconds.'
@@ -436,19 +443,14 @@ def predict_structure(
     )
     all_inference_start_time = time.time()
     all_inference_results = []
+    
     for seed, example in zip(fold_input.rng_seeds, featurised_examples):
         print(f'Running model inference with seed {seed}...')
         inference_start_time = time.time()
         rng_key = jax.random.PRNGKey(seed)
         
-        # 添加错误处理和数值检查
         try:
-            # 设置内存使用限制
-            resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
-            
-            # 使用上下文管理器管理大对象
-            with managed_memory():
-                result = model_runner.run_inference(example, rng_key)
+            result = model_runner.run_inference(example, rng_key)
             
             print(
                 f'Running model inference with seed {seed} took'
@@ -686,17 +688,18 @@ def make_model_config(
     # 性能优化配置
     config.global_config.flash_attention_implementation = 'xla'
     config.global_config.deterministic = False
-    config.global_config.subbatch_size = 8  # 增加子批次大小
+    config.global_config.subbatch_size = 16  # 增大子批次大小
     config.global_config.precision = jnp.float32
     
-    # 内存优化
-    config.global_config.max_cache_size = 2048  # 增加缓存大小
-    config.global_config.garbage_collection_interval = 50  # 更频繁的GC
+    # JAX 优化
+    config.global_config.jit_compile = True
+    config.global_config.parallel_compute = True
+    config.global_config.remat = True
+    config.global_config.scan_layers = True
     
-    # 计算优化
-    config.global_config.parallel_compute = True  # 启用并行计算
-    config.global_config.remat = True  # 启用梯度检查点
-    config.global_config.scan_layers = True  # 使用scan优化循环
+    # 缓存优化
+    config.global_config.max_cache_size = 4096  # 增大缓存大小
+    config.global_config.garbage_collection_interval = 200  # 减少GC频率
     
     return config
 
