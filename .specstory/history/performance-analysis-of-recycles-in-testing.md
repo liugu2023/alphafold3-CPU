@@ -1815,6 +1815,40 @@ def predict_structure(...):
 
 ---
 
+_**User**_
+
+Traceback (most recent call last):
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 894, in <module>
+    app.run(main)
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/absl/app.py", line 308, in run
+    _run_main(main, args)
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/absl/app.py", line 254, in _run_main
+    sys.exit(main(argv))
+             ^^^^^^^^^^
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 879, in main
+    process_fold_input(
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 727, in process_fold_input
+    all_inference_results = predict_structure(
+                            ^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 465, in predict_structure
+    example = validate_features(example)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 448, in validate_features
+    for key, value in example.items():
+                      ^^^^^^^^^^^^^
+AttributeError: 'list' object has no attribute 'items'
+Warning: Could not extract inference time for num_recycles=
+
+---
+
+_**Assistant**_
+
+
+
+看起来问题出在 `validate_features` 函数中，
+
+---
+
 
 
 ---

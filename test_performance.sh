@@ -24,7 +24,7 @@ echo "Created base directory: $BASE_DIR"
     FULL_LOG="$OUTPUT_DIR/full_log.txt"
     
     # 记录开始时间
-    echo "=== Test with num_recycles = $recycles ===" > $TIME_LOG
+    echo "=== Test with num_recycles = 10 ===" > $TIME_LOG
     echo "Start time: $(date)" >> $TIME_LOG
     START_TIME=$(date +%s)
     
@@ -80,7 +80,7 @@ echo "Created base directory: $BASE_DIR"
     if [ -n "$INFERENCE_TIME" ]; then
         echo "num_recycles=$recycles: $INFERENCE_TIME seconds" >> "$BASE_DIR/comparison.txt"
     else
-        echo "Warning: Could not extract inference time for num_recycles=$recycles"
+        echo "Warning: Could not extract inference time for num_recycles=10"
         echo "num_recycles=$recycles: ERROR" >> "$BASE_DIR/comparison.txt"
     fi
     

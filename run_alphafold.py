@@ -445,12 +445,24 @@ def predict_structure(
     featurised_examples = []
     def validate_features(example):
         """验证特征的有效性"""
-        for key, value in example.items():
-            if isinstance(value, (np.ndarray, jnp.ndarray)):
-                if np.any(np.isnan(value)):
-                    print(f"Warning: NaN in feature {key} of shape {value.shape}")
-                if np.any(np.isinf(value)):
-                    print(f"Warning: Inf in feature {key} of shape {value.shape}")
+        if isinstance(example, list):
+            # 如果是列表，验证每个元素
+            for item in example:
+                if isinstance(item, dict):
+                    for key, value in item.items():
+                        if isinstance(value, (np.ndarray, jnp.ndarray)):
+                            if np.any(np.isnan(value)):
+                                print(f"Warning: NaN in feature {key} of shape {value.shape}")
+                            if np.any(np.isinf(value)):
+                                print(f"Warning: Inf in feature {key} of shape {value.shape}")
+        elif isinstance(example, dict):
+            # 如果是字典，直接验证
+            for key, value in example.items():
+                if isinstance(value, (np.ndarray, jnp.ndarray)):
+                    if np.any(np.isnan(value)):
+                        print(f"Warning: NaN in feature {key} of shape {value.shape}")
+                    if np.any(np.isinf(value)):
+                        print(f"Warning: Inf in feature {key} of shape {value.shape}")
         return example
     
     for seed in fold_input.rng_seeds:
@@ -753,24 +765,19 @@ def make_model_config(
     config = model.Model.Config()
     
     # 修改数值计算配置
-    config.global_config.precision = jnp.float32  # 使用 float32
-    config.global_config.deterministic = True     # 启用确定性计算
-    config.global_config.subbatch_size = 8       # 减小批次大小，避免数值累积
+    config.global_config.precision = jnp.float32
+    config.global_config.deterministic = True
+    config.global_config.subbatch_size = 4  # 减小批次大小以提高稳定性
     
-    # 添加数值稳定性配置
-    config.global_config.eps = 1e-7              # 增加数值稳定性
-    config.global_config.inf_value = 1e6         # 限制最大值
-    config.global_config.nan_guard = True        # 启用 NaN 检查
+    # 数值稳定性配置
+    config.global_config.eps = 1e-6
+    config.global_config.inf_value = 1e6
+    config.global_config.nan_guard = True
+    config.global_config.softmax_scale = 0.5  # 降低 softmax 温度
     
-    # 优化注意力机制计算
-    config.global_config.attention_clip = True    # 裁剪注意力权重
-    config.global_config.attention_max = 20.0     # 限制最大注意力值
-    config.global_config.softmax_scale = 1.0      # 调整 softmax 温度
-    
-    # 激活函数和梯度配置
-    config.global_config.activation_bound = True   # 限制激活函数输出
-    config.global_config.gradient_clip = 1.0      # 梯度裁剪
-    config.global_config.layer_norm_eps = 1e-6    # Layer Norm 稳定性
+    # 注意力机制配置
+    config.global_config.attention_clip = True
+    config.global_config.attention_max = 10.0
     
     return config
 
