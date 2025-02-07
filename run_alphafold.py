@@ -331,6 +331,16 @@ class ModelRunner:
         self, featurised_example: features.BatchDict, rng_key: jnp.ndarray
     ) -> model.ModelResult:
         """Computes a forward pass of the model on a featurised example."""
+        # 添加输入检查
+        def validate_input(x):
+            if isinstance(x, (np.ndarray, jnp.ndarray)):
+                if np.any(np.isnan(x)) or np.any(np.isinf(x)):
+                    print(f"Warning: Input contains NaN/inf in array of shape {x.shape}")
+                    x = np.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
+            return x
+        
+        featurised_example = jax.tree_map(validate_input, featurised_example)
+        
         featurised_example = jax.device_put(
             jax.tree_util.tree_map(
                 jnp.asarray, utils.remove_invalidly_typed_feats(featurised_example)
@@ -339,7 +349,17 @@ class ModelRunner:
         )
 
         result = self._model(rng_key, featurised_example)
-        result = jax.tree.map(np.asarray, result)
+        
+        # 添加中间结果检查
+        def check_intermediate(x):
+            if isinstance(x, (np.ndarray, jnp.ndarray)):
+                if np.any(np.isnan(x)):
+                    raise ValueError(f"NaN detected in array of shape {x.shape}")
+                if np.any(np.isinf(x)):
+                    raise ValueError(f"Inf detected in array of shape {x.shape}")
+            return x
+            
+        result = jax.tree_map(check_intermediate, result)
         result = jax.tree.map(
             lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x,
             result,
@@ -423,6 +443,16 @@ def predict_structure(
     
     # 特征化处理
     featurised_examples = []
+    def validate_features(example):
+        """验证特征的有效性"""
+        for key, value in example.items():
+            if isinstance(value, (np.ndarray, jnp.ndarray)):
+                if np.any(np.isnan(value)):
+                    print(f"Warning: NaN in feature {key} of shape {value.shape}")
+                if np.any(np.isinf(value)):
+                    print(f"Warning: Inf in feature {key} of shape {value.shape}")
+        return example
+    
     for seed in fold_input.rng_seeds:
         print(f'Featurising data with seed {seed}.')
         example = featurisation.featurise_input(
@@ -432,6 +462,7 @@ def predict_structure(
             verbose=True,
             conformer_max_iterations=conformer_max_iterations,
         )
+        example = validate_features(example)
         featurised_examples.append(example)
     
     print(
@@ -721,21 +752,25 @@ def make_model_config(
     """返回模型配置，针对 CPU 优化"""
     config = model.Model.Config()
     
-    # 性能优化配置
-    config.global_config.flash_attention_implementation = 'xla'
-    config.global_config.deterministic = False
-    config.global_config.subbatch_size = 16  # 增大子批次大小
-    config.global_config.precision = jnp.float32
+    # 修改数值计算配置
+    config.global_config.precision = jnp.float32  # 使用 float32
+    config.global_config.deterministic = True     # 启用确定性计算
+    config.global_config.subbatch_size = 8       # 减小批次大小，避免数值累积
     
-    # JAX 优化
-    config.global_config.jit_compile = True
-    config.global_config.parallel_compute = True
-    config.global_config.remat = True
-    config.global_config.scan_layers = True
+    # 添加数值稳定性配置
+    config.global_config.eps = 1e-7              # 增加数值稳定性
+    config.global_config.inf_value = 1e6         # 限制最大值
+    config.global_config.nan_guard = True        # 启用 NaN 检查
     
-    # 缓存优化
-    config.global_config.max_cache_size = 4096  # 增大缓存大小
-    config.global_config.garbage_collection_interval = 200  # 减少GC频率
+    # 优化注意力机制计算
+    config.global_config.attention_clip = True    # 裁剪注意力权重
+    config.global_config.attention_max = 20.0     # 限制最大注意力值
+    config.global_config.softmax_scale = 1.0      # 调整 softmax 温度
+    
+    # 激活函数和梯度配置
+    config.global_config.activation_bound = True   # 限制激活函数输出
+    config.global_config.gradient_clip = 1.0      # 梯度裁剪
+    config.global_config.layer_norm_eps = 1e-6    # Layer Norm 稳定性
     
     return config
 

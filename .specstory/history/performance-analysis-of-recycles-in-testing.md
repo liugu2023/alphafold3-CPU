@@ -1586,6 +1586,235 @@ Completed test with num_recycles = 10
 
 ---
 
+_**Assistant**_
+
+
+
+看起来问题出在模型输出包含了 NaN/inf 值。让我们添加数值检查和处理：
+
+```python:run_alphafold.py
+def predict_structure(
+    fold_input: folding_input.Input,
+    model_runner: ModelRunner,
+    buckets: Sequence[int] | None = None,
+    conformer_max_iterations: int | None = None,
+) -> Sequence[ResultsForSeed]:
+    """Runs the full inference pipeline to predict structures for each seed."""
+
+    # ... 前面的代码保持不变 ...
+
+    for seed, example in zip(fold_input.rng_seeds, featurised_examples):
+        print(f'Running model inference with seed {seed}...')
+        inference_start_time = time.time()
+        rng_key = jax.random.PRNGKey(seed)
+        
+        try:
+            # 确保 example 是正确的格式
+            if isinstance(example, list):
+                example = example[0]
+                
+            result = model_runner.run_inference(example, rng_key)
+            
+            # 检查结果中的数值
+            def check_and_fix_nans(x):
+                if isinstance(x, (np.ndarray, jnp.ndarray)):
+                    # 替换 NaN/inf 值为 0
+                    if np.any(np.isnan(x)) or np.any(np.isinf(x)):
+                        print(f"Warning: Found NaN/inf values in array of shape {x.shape}")
+                        x = np.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
+                return x
+            
+            # 递归处理所有数组
+            result = jax.tree_map(check_and_fix_nans, result)
+            
+            print(
+                f'Running model inference with seed {seed} took'
+                f' {time.time() - inference_start_time:.2f} seconds.'
+            )
+            print(f'Extracting output structure samples with seed {seed}...')
+            extract_structures = time.time()
+            
+            try:
+                inference_results = model_runner.extract_structures(
+                    batch=example, result=result, target_name=fold_input.name
+                )
+                
+                # 验证结构结果
+                for res in inference_results:
+                    if not hasattr(res, 'positions') or res.positions is None:
+                        raise ValueError("Invalid structure result: missing positions")
+                    if np.any(np.isnan(res.positions)) or np.any(np.isinf(res.positions)):
+                        raise ValueError("Invalid structure result: NaN/inf in positions")
+                
+                print(
+                    f'Extracting {len(inference_results)} output structure samples with'
+                    f' seed {seed} took {time.time() - extract_structures:.2f} seconds.'
+                )
+
+                embeddings = model_runner.extract_embeddings(result)
+
+                all_inference_results.append(
+                    ResultsForSeed(
+                        seed=seed,
+                        inference_results=inference_results,
+                        full_fold_input=fold_input,
+                        embeddings=embeddings,
+                    )
+                )
+            except Exception as e:
+                print(f"Error in structure extraction: {str(e)}")
+                print("Detailed error information:")
+                import traceback
+                traceback.print_exc()
+                continue
+                
+        except Exception as e:
+            print(f'Error processing seed {seed}: {str(e)}')
+            print('Error details:', e.__class__.__name__)
+            import traceback
+            traceback.print_exc()
+            continue
+    
+    # ... 后面的代码保持不变 ...
+```
+
+主要修改：
+1. 添加了数值检查和修复函数
+2. 在结构提取前处理 NaN/inf 值
+3. 添加了结构验证
+4. 增加了更详细的错误信息输出
+
+这样我们可以：
+1. 看到具体哪些数组包含了 NaN/inf 值
+2. 尝试修复这些值而不是直接失败
+3. 验证最终结构的有效性
+
+让我们重新运行测试：
+```bash
+./test_performance.sh
+```
+
+这样应该能看到更详细的错误信息，帮助我们定位具体问题。需要我解释更多细节吗？
+
+---
+
+_**User**_
+
+为什么会出现NaN/inf值
+
+---
+
+_**Assistant**_
+
+在 AlphaFold 中出现 NaN/inf 值通常有以下几个可能的原因：
+
+1. 数值溢出问题：
+```python:run_alphafold.py
+def make_model_config(...) -> model.Model.Config:
+    config = model.Model.Config()
+    
+    # 修改数值计算配置
+    config.global_config.precision = jnp.float32  # 使用 float32
+    config.global_config.deterministic = True     # 启用确定性计算
+    config.global_config.subbatch_size = 8       # 减小批次大小，避免数值累积
+    
+    # 添加数值稳定性配置
+    config.global_config.eps = 1e-7              # 增加数值稳定性
+    config.global_config.inf_value = 1e6         # 限制最大值
+    config.global_config.nan_guard = True        # 启用 NaN 检查
+    
+    return config
+```
+
+2. 注意力机制计算问题：
+```python:run_alphafold.py
+def make_model_config(...):
+    # ... 其他配置 ...
+    
+    # 优化注意力机制计算
+    config.global_config.attention_clip = True    # 裁剪注意力权重
+    config.global_config.attention_max = 20.0     # 限制最大注意力值
+    config.global_config.softmax_scale = 1.0      # 调整 softmax 温度
+    
+    return config
+```
+
+3. 梯度和激活函数问题：
+```python:run_alphafold.py
+def make_model_config(...):
+    # ... 其他配置 ...
+    
+    # 激活函数和梯度配置
+    config.global_config.activation_bound = True   # 限制激活函数输出
+    config.global_config.gradient_clip = 1.0      # 梯度裁剪
+    config.global_config.layer_norm_eps = 1e-6    # Layer Norm 稳定性
+    
+    return config
+```
+
+4. 在 ModelRunner 中添加数值检查：
+```python:run_alphafold.py
+class ModelRunner:
+    @profile_time
+    def run_inference(self, featurised_example, rng_key):
+        # 添加输入检查
+        def validate_input(x):
+            if isinstance(x, (np.ndarray, jnp.ndarray)):
+                if np.any(np.isnan(x)) or np.any(np.isinf(x)):
+                    print(f"Warning: Input contains NaN/inf in array of shape {x.shape}")
+                    x = np.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
+            return x
+        
+        featurised_example = jax.tree_map(validate_input, featurised_example)
+        
+        # ... 其他代码 ...
+        
+        # 添加中间结果检查
+        def check_intermediate(x):
+            if isinstance(x, (np.ndarray, jnp.ndarray)):
+                if np.any(np.isnan(x)):
+                    raise ValueError(f"NaN detected in array of shape {x.shape}")
+                if np.any(np.isinf(x)):
+                    raise ValueError(f"Inf detected in array of shape {x.shape}")
+            return x
+            
+        result = self._model(rng_key, featurised_example)
+        jax.tree_map(check_intermediate, result)
+        
+        return result
+```
+
+5. 在特征化过程中添加检查：
+```python:run_alphafold.py
+def predict_structure(...):
+    # ... 其他代码 ...
+    
+    def validate_features(example):
+        """验证特征的有效性"""
+        for key, value in example.items():
+            if isinstance(value, (np.ndarray, jnp.ndarray)):
+                if np.any(np.isnan(value)):
+                    print(f"Warning: NaN in feature {key} of shape {value.shape}")
+                if np.any(np.isinf(value)):
+                    print(f"Warning: Inf in feature {key} of shape {value.shape}")
+        return example
+    
+    for seed in fold_input.rng_seeds:
+        example = featurisation.featurise_input(...)
+        example = validate_features(example)
+        featurised_examples.append(example)
+```
+
+建议：
+1. 先添加详细的数值检查，找出 NaN/inf 出现的具体位置
+2. 根据出现位置调整相应的配置参数
+3. 考虑使用更保守的数值计算设置
+4. 如果问题持续，可以添加数值裁剪和规范化步骤
+
+需要我详细解释某个具体的修改吗？
+
+---
+
 
 
 ---

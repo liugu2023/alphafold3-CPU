@@ -13,8 +13,7 @@ mkdir -p $BASE_DIR
 echo "Created base directory: $BASE_DIR"
 
 # 固定使用10次循环
-for recycles in 10; do
-    echo "Testing with num_recycles = $recycles"
+
     
     # 创建输出目录
     OUTPUT_DIR="$BASE_DIR/recycles_${recycles}"
@@ -61,10 +60,9 @@ for recycles in 10; do
       --output_dir=$OUTPUT_DIR \
       --model_dir=/archive/liugu/model \
       --db_dir=/archive/plato/task3/database \
-      --num_recycles=$recycles \
       --num_diffusion_samples=5 \
-      --jackhmmer_n_cpu=8 \
-      --nhmmer_n_cpu=8 \
+      --jackhmmer_n_cpu=30 \
+      --nhmmer_n_cpu=30 \
       --flash_attention_implementation=xla \
       2>&1 | tee $FULL_LOG
     
@@ -86,9 +84,8 @@ for recycles in 10; do
         echo "num_recycles=$recycles: ERROR" >> "$BASE_DIR/comparison.txt"
     fi
     
-    echo "Completed test with num_recycles = $recycles"
+    
     echo "----------------------------------------"
-done
 
 # 打印比较结果
 echo -e "\nPerformance comparison:"
