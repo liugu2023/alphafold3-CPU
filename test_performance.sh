@@ -16,7 +16,7 @@ echo "Created base directory: $BASE_DIR"
 
     
     # 创建输出目录
-    OUTPUT_DIR="$BASE_DIR/recycles_${recycles}"
+    OUTPUT_DIR="$BASE_DIR/recycles_10"
     mkdir -p $OUTPUT_DIR
     echo "Created output directory: $OUTPUT_DIR"
     
