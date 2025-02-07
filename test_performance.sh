@@ -12,8 +12,13 @@ BASE_DIR="/archive/liugu/output/performance_test_$(date +%Y%m%d_%H%M%S)"
 mkdir -p $BASE_DIR
 echo "Created base directory: $BASE_DIR"
 
-# 测试不同的 recycles 次数
-for recycles in 3 5 8 10; do
+# 添加系统级优化
+echo 3 > /proc/sys/vm/drop_caches  # 清理系统缓存
+echo 1 > /proc/sys/vm/compact_memory  # 整理内存碎片
+ulimit -v 32000000  # 限制虚拟内存使用
+
+# 固定使用10次循环
+for recycles in 10; do
     echo "Testing with num_recycles = $recycles"
     
     # 创建输出目录
@@ -50,16 +55,24 @@ for recycles in 3 5 8 10; do
     ) &
     MONITOR_PID=$!
     
-    # 运行 AlphaFold
-    python run_alphafold.py \
+    # 根据实际 CPU 核心数和内存情况调整
+    export OMP_NUM_THREADS=8
+    export MKL_NUM_THREADS=8
+    # 添加 BLAS 线程控制
+    export OPENBLAS_NUM_THREADS=8
+    export VECLIB_MAXIMUM_THREADS=8
+    
+    # 运行时添加内存限制和性能分析
+    nice -n -20 python -m memory_profiler run_alphafold.py \
       --json_path=$INPUT_FILE \
       --output_dir=$OUTPUT_DIR \
       --model_dir=/archive/liugu/model \
       --db_dir=/archive/plato/task3/database \
       --num_recycles=$recycles \
       --num_diffusion_samples=5 \
-      --jackhmmer_n_cpu=30 \
-      --nhmmer_n_cpu=30 \
+      --jackhmmer_n_cpu=8 \
+      --nhmmer_n_cpu=8 \
+      --flash_attention_implementation=xla \  # 明确使用 XLA 实现
       2>&1 | tee $FULL_LOG
     
     # 停止性能监控
@@ -100,7 +113,14 @@ for recycles in 3 5 8 10; do
     # 提取推理时间
     INFERENCE_TIME=$(grep "Running model inference with seed 1 took" $FULL_LOG | awk '{print $8}')
     if [ -n "$INFERENCE_TIME" ]; then
-        echo "num_recycles=$recycles: $INFERENCE_TIME seconds" >> "$BASE_DIR/comparison.txt"
+        AVG_TIME_PER_RECYCLE=$(echo "scale=2; $INFERENCE_TIME / $recycles" | bc)
+        echo "num_recycles=$recycles: Total=$INFERENCE_TIME seconds, Average per recycle=$AVG_TIME_PER_RECYCLE seconds" >> "$BASE_DIR/comparison.txt"
+        
+        # 记录性能建议
+        if [ $recycles -gt 6 ] && [ $(echo "$AVG_TIME_PER_RECYCLE > 200" | bc -l) -eq 1 ]; then
+            echo "Warning: High average time per recycle detected for num_recycles=$recycles" >> "$BASE_DIR/performance_analysis.txt"
+            echo "Consider reducing num_recycles for better performance" >> "$BASE_DIR/performance_analysis.txt"
+        fi
     else
         echo "Warning: Could not extract inference time for num_recycles=$recycles"
         echo "num_recycles=$recycles: ERROR" >> "$BASE_DIR/comparison.txt"

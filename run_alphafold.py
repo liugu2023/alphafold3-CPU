@@ -33,6 +33,8 @@ import textwrap
 import time
 import typing
 from typing import overload
+import resource
+import gc
 
 from absl import app
 from absl import flags
@@ -279,14 +281,22 @@ def make_model_config(
 ) -> model.Model.Config:
     """返回模型配置，针对 CPU 优化"""
     config = model.Model.Config()
-    config.global_config.flash_attention_implementation = 'xla'  # CPU 优化
-    config.heads.diffusion.eval.num_samples = num_diffusion_samples
-    config.num_recycles = num_recycles
-    config.return_embeddings = return_embeddings
     
-    # 添加一些优化配置
-    config.global_config.deterministic = False  # 允许非确定性优化
-    config.global_config.subbatch_size = 4  # 添加子批次处理
+    # 性能优化配置
+    config.global_config.flash_attention_implementation = 'xla'
+    config.global_config.deterministic = False
+    config.global_config.subbatch_size = 8  # 增加子批次大小
+    config.global_config.precision = jnp.float32
+    
+    # 内存优化
+    config.global_config.max_cache_size = 2048  # 增加缓存大小
+    config.global_config.garbage_collection_interval = 50  # 更频繁的GC
+    
+    # 计算优化
+    config.global_config.parallel_compute = True  # 启用并行计算
+    config.global_config.remat = True  # 启用梯度检查点
+    config.global_config.scan_layers = True  # 使用scan优化循环
+    
     return config
 
 
@@ -302,6 +312,8 @@ class ModelRunner:
     self._model_config = config
     self._device = device
     self._model_dir = model_dir
+    self._cache = {}
+    self._max_cache_size = 1000
 
   @functools.cached_property
   def model_params(self) -> hk.Params:
@@ -322,27 +334,39 @@ class ModelRunner:
         jax.jit(forward_fn.apply, device=self._device), self.model_params
     )
 
+  def _get_cached_result(self, key):
+    return self._cache.get(key)
+        
+  def _cache_result(self, key, value):
+    if len(self._cache) > self._max_cache_size:
+        self._cache.pop(next(iter(self._cache)))
+    self._cache[key] = value
+
+  @profile_time
   def run_inference(
       self, featurised_example: features.BatchDict, rng_key: jnp.ndarray
   ) -> model.ModelResult:
     """Computes a forward pass of the model on a featurised example."""
-    featurised_example = jax.device_put(
-        jax.tree_util.tree_map(
-            jnp.asarray, utils.remove_invalidly_typed_feats(featurised_example)
-        ),
-        self._device,
-    )
-
+    # 添加预处理优化
+    featurised_example = self._preprocess_features(featurised_example)
+    
+    # 使用 jax.block_until_ready 确保计算完成
     result = self._model(rng_key, featurised_example)
-    result = jax.tree.map(np.asarray, result)
+    result = jax.block_until_ready(result)
+    
+    # 优化数据类型转换
     result = jax.tree.map(
-        lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x,
-        result,
+        lambda x: x.astype(jnp.float32) if hasattr(x, 'astype') else x,
+        result
     )
-    result = dict(result)
-    identifier = self.model_params['__meta__']['__identifier__'].tobytes()
-    result['__identifier__'] = identifier
+    
     return result
+
+  def _preprocess_features(self, features):
+    """优化特征预处理"""
+    # 使用 jax.vmap 进行批处理
+    features = jax.vmap(self._normalize_features)(features)
+    return features
 
   def extract_structures(
       self,
@@ -369,6 +393,16 @@ class ModelRunner:
       embeddings['pair_embeddings'] = result['pair_embeddings']
     return embeddings or None
 
+  def run_inference_with_retry(self, *args, max_retries=3, **kwargs):
+    for attempt in range(max_retries):
+      try:
+        return self.run_inference(*args, **kwargs)
+      except Exception as e:
+        if attempt == max_retries - 1:
+          raise
+        print(f"Retry {attempt + 1}/{max_retries} due to: {e}")
+        time.sleep(1)
+
 
 @dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
 class ResultsForSeed:
@@ -394,96 +428,81 @@ def predict_structure(
     buckets: Sequence[int] | None = None,
     conformer_max_iterations: int | None = None,
 ) -> Sequence[ResultsForSeed]:
-  """Runs the full inference pipeline to predict structures for each seed."""
+    """Runs the full inference pipeline to predict structures for each seed."""
 
-  print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
-  featurisation_start_time = time.time()
-  ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
-  featurised_examples = featurisation.featurise_input(
-      fold_input=fold_input,
-      buckets=buckets,
-      ccd=ccd,
-      verbose=True,
-      conformer_max_iterations=conformer_max_iterations,
-  )
-  print(
-      f'Featurising data with {len(fold_input.rng_seeds)} seed(s) took'
-      f' {time.time() - featurisation_start_time:.2f} seconds.'
-  )
-  print(
-      'Running model inference and extracting output structure samples with'
-      f' {len(fold_input.rng_seeds)} seed(s)...'
-  )
-  all_inference_start_time = time.time()
-  all_inference_results = []
-  for seed, example in zip(fold_input.rng_seeds, featurised_examples):
-    print(f'Running model inference with seed {seed}...')
-    inference_start_time = time.time()
-    rng_key = jax.random.PRNGKey(seed)
-    
-    # 添加错误处理和数值检查
-    try:
-        result = model_runner.run_inference(example, rng_key)
-        
-        # 检查结果中是否包含 NaN/inf 值
-        def check_array(arr, name):
-            if isinstance(arr, (np.ndarray, jnp.ndarray)):
-                if np.any(np.isnan(arr)) or np.any(np.isinf(arr)):
-                    print(f'Warning: {name} contains NaN/inf values')
-                    # 替换 NaN/inf 值为 0
-                    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-            return arr
-        
-        # 递归检查并清理结果字典
-        def clean_result(d):
-            if isinstance(d, dict):
-                return {k: clean_result(v) for k, v in d.items()}
-            elif isinstance(d, (list, tuple)):
-                return type(d)(clean_result(x) for x in d)
-            else:
-                return check_array(d, 'array')
-        
-        result = clean_result(result)
-        
-        print(
-            f'Running model inference with seed {seed} took'
-            f' {time.time() - inference_start_time:.2f} seconds.'
+    print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
+    featurisation_start_time = time.time()
+    ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
+    with multiprocessing.Pool() as pool:
+        featurised_examples = pool.map(
+            partial(featurisation.featurise_input, 
+                   buckets=buckets,
+                   verbose=False),
+            fold_input.chunks
         )
-        print(f'Extracting output structure samples with seed {seed}...')
-        extract_structures = time.time()
-        inference_results = model_runner.extract_structures(
-            batch=example, result=result, target_name=fold_input.name
-        )
-        print(
-            f'Extracting {len(inference_results)} output structure samples with'
-            f' seed {seed} took {time.time() - extract_structures:.2f} seconds.'
-        )
-
-        embeddings = model_runner.extract_embeddings(result)
-
-        all_inference_results.append(
-            ResultsForSeed(
-                seed=seed,
-                inference_results=inference_results,
-                full_fold_input=fold_input,
-                embeddings=embeddings,
+    print(
+        f'Featurising data with {len(fold_input.rng_seeds)} seed(s) took'
+        f' {time.time() - featurisation_start_time:.2f} seconds.'
+    )
+    print(
+        'Running model inference and extracting output structure samples with'
+        f' {len(fold_input.rng_seeds)} seed(s)...'
+    )
+    all_inference_start_time = time.time()
+    all_inference_results = []
+    for seed, example in zip(fold_input.rng_seeds, featurised_examples):
+        print(f'Running model inference with seed {seed}...')
+        inference_start_time = time.time()
+        rng_key = jax.random.PRNGKey(seed)
+        
+        # 添加错误处理和数值检查
+        try:
+            # 设置内存使用限制
+            resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
+            
+            # 使用上下文管理器管理大对象
+            with managed_memory():
+                result = model_runner.run_inference(example, rng_key)
+            
+            print(
+                f'Running model inference with seed {seed} took'
+                f' {time.time() - inference_start_time:.2f} seconds.'
             )
-        )
-    except Exception as e:
-        print(f'Error processing seed {seed}: {str(e)}')
-        print('Skipping this seed and continuing with the next one...')
-        continue
+            print(f'Extracting output structure samples with seed {seed}...')
+            extract_structures = time.time()
+            inference_results = model_runner.extract_structures(
+                batch=example, result=result, target_name=fold_input.name
+            )
+            print(
+                f'Extracting {len(inference_results)} output structure samples with'
+                f' seed {seed} took {time.time() - extract_structures:.2f} seconds.'
+            )
+
+            embeddings = model_runner.extract_embeddings(result)
+
+            all_inference_results.append(
+                ResultsForSeed(
+                    seed=seed,
+                    inference_results=inference_results,
+                    full_fold_input=fold_input,
+                    embeddings=embeddings,
+                )
+            )
+        except Exception as e:
+            print(f'Error processing seed {seed}: {str(e)}')
+            print('Skipping this seed and continuing with the next one...')
+            continue
         
-  print(
-      'Running model inference and extracting output structures with'
-      f' {len(fold_input.rng_seeds)} seed(s) took'
-      f' {time.time() - all_inference_start_time:.2f} seconds.'
-  )
-  
-  if not all_inference_results:
-    raise ValueError('No valid predictions were generated for any seed.')
+    print(
+        'Running model inference and extracting output structures with'
+        f' {len(fold_input.rng_seeds)} seed(s) took'
+        f' {time.time() - all_inference_start_time:.2f} seconds.'
+    )
     
-  return all_inference_results
+    if not all_inference_results:
+        raise ValueError('No valid predictions were generated for any seed.')
+    
+    return all_inference_results
 
 
 def write_fold_input_json(
@@ -666,6 +685,17 @@ def process_fold_input(
 
   print(f'Fold job {fold_input.name} done.\n')
   return output
+
+
+def profile_time(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        start = time.time()
+        result = func(*args, **kwargs)
+        duration = time.time() - start
+        print(f"{func.__name__} took {duration:.2f} seconds")
+        return result
+    return wrapper
 
 
 def main(_):
