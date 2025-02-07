@@ -421,14 +421,18 @@ def predict_structure(
     featurisation_start_time = time.time()
     ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
     
-    # 直接处理整个 fold_input
-    featurised_examples = featurisation.featurise_input(
-        fold_input=fold_input,
-        buckets=buckets,
-        ccd=ccd,
-        verbose=True,
-        conformer_max_iterations=conformer_max_iterations,
-    )
+    # 特征化处理
+    featurised_examples = []
+    for seed in fold_input.rng_seeds:
+        print(f'Featurising data with seed {seed}.')
+        example = featurisation.featurise_input(
+            fold_input=fold_input,
+            buckets=buckets,
+            ccd=ccd,
+            verbose=True,
+            conformer_max_iterations=conformer_max_iterations,
+        )
+        featurised_examples.append(example)
     
     print(
         f'Featurising data with {len(fold_input.rng_seeds)} seed(s) took'
@@ -441,12 +445,16 @@ def predict_structure(
     all_inference_start_time = time.time()
     all_inference_results = []
     
-    for seed, example in zip(fold_input.rng_seeds, [featurised_examples]):
+    for seed, example in zip(fold_input.rng_seeds, featurised_examples):
         print(f'Running model inference with seed {seed}...')
         inference_start_time = time.time()
         rng_key = jax.random.PRNGKey(seed)
         
         try:
+            # 确保 example 是正确的格式
+            if isinstance(example, list):
+                example = example[0]  # 如果是列表，取第一个元素
+                
             result = model_runner.run_inference(example, rng_key)
             
             print(
@@ -475,6 +483,9 @@ def predict_structure(
             )
         except Exception as e:
             print(f'Error processing seed {seed}: {str(e)}')
+            print('Error details:', e.__class__.__name__)
+            import traceback
+            traceback.print_exc()
             print('Skipping this seed and continuing with the next one...')
             continue
         

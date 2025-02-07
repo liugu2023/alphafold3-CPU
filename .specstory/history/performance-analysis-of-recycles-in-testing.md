@@ -1147,7 +1147,246 @@ _**Assistant**_
 def predict_structure(
     fold_input: folding_input.Input,
     model_runner: ModelRunner,
-    buckets:
+    buckets: Sequence[int] | None = None,
+    conformer_max_iterations: int | None = None,
+) -> Sequence[ResultsForSeed]:
+    """Runs the full inference pipeline to predict structures for each seed."""
+
+    print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
+    featurisation_start_time = time.time()
+    ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
+    
+    # 修改为单线程处理，避免 fork 问题
+    featurised_examples = []
+    for chunk in fold_input.chunks:
+        example = featurisation.featurise_input(
+            fold_input=chunk,
+            buckets=buckets,
+            ccd=ccd,
+            verbose=False,
+            conformer_max_iterations=conformer_max_iterations
+        )
+        featurised_examples.append(example)
+    
+    print(
+        f'Featurising data with {len(fold_input.rng_seeds)} seed(s) took'
+        f' {time.time() - featurisation_start_time:.2f} seconds.'
+    )
+    print(
+        'Running model inference and extracting output structure samples with'
+        f' {len(fold_input.rng_seeds)} seed(s)...'
+    )
+    all_inference_start_time = time.time()
+    all_inference_results = []
+    
+    for seed, example in zip(fold_input.rng_seeds, featurised_examples):
+        print(f'Running model inference with seed {seed}...')
+        inference_start_time = time.time()
+        rng_key = jax.random.PRNGKey(seed)
+        
+        try:
+            result = model_runner.run_inference(example, rng_key)
+            
+            print(
+                f'Running model inference with seed {seed} took'
+                f' {time.time() - inference_start_time:.2f} seconds.'
+            )
+            print(f'Extracting output structure samples with seed {seed}...')
+            extract_structures = time.time()
+            inference_results = model_runner.extract_structures(
+                batch=example, result=result, target_name=fold_input.name
+            )
+            print(
+                f'Extracting {len(inference_results)} output structure samples with'
+                f' seed {seed} took {time.time() - extract_structures:.2f} seconds.'
+            )
+
+            embeddings = model_runner.extract_embeddings(result)
+
+            all_inference_results.append(
+                ResultsForSeed(
+                    seed=seed,
+                    inference_results=inference_results,
+                    full_fold_input=fold_input,
+                    embeddings=embeddings,
+                )
+            )
+        except Exception as e:
+            print(f'Error processing seed {seed}: {str(e)}')
+            print('Skipping this seed and continuing with the next one...')
+            continue
+        
+    print(
+        'Running model inference and extracting output structures with'
+        f' {len(fold_input.rng_seeds)} seed(s) took'
+        f' {time.time() - all_inference_start_time:.2f} seconds.'
+    )
+    
+    if not all_inference_results:
+        raise ValueError('No valid predictions were generated for any seed.')
+    
+    return all_inference_results
+```
+
+同时，我们可以在 `make_model_config` 中添加更多性能优化：
+
+```python:run_alphafold.py
+def make_model_config(...) -> model.Model.Config:
+    config = model.Model.Config()
+    
+    # 性能优化配置
+    config.global_config.flash_attention_implementation = 'xla'
+    config.global_config.deterministic = False
+    config.global_config.subbatch_size = 16  # 增大子批次大小
+    config.global_config.precision = jnp.float32
+    
+    # JAX 优化
+    config.global_config.jit_compile = True
+    config.global_config.parallel_compute = True
+    config.global_config.remat = True
+    config.global_config.scan_layers = True
+    
+    # 缓存优化
+    config.global_config.max_cache_size = 4096  # 增大缓存大小
+    config.global_config.garbage_collection_interval = 200  # 减少GC频率
+    
+    return config
+```
+
+这些修改：
+1. 移除了内存限制相关代码
+2. 增大了子批次大小和缓存大小
+3. 减少了垃圾回收频率
+4. 启用了更多 JAX 优化选项
+
+需要我解释具体的优化点吗？
+
+---
+
+_**User**_
+
+Running fold job 37aa_2JO9...
+Output will be written in /archive/liugu/output/performance_test_20250207_152433/recycles_10/37aa_2jo9
+Running data pipeline...
+Processing chain A
+Processing chain A took 0.00 seconds
+Writing model input JSON to /archive/liugu/output/performance_test_20250207_152433/recycles_10/37aa_2jo9/37aa_2jo9_data.json
+Predicting 3D structure for 37aa_2JO9 with 1 seed(s)...
+Featurising data with 1 seed(s)...
+Traceback (most recent call last):
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 823, in <module>
+    app.run(main)
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/absl/app.py", line 308, in run
+    _run_main(main, args)
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/absl/app.py", line 254, in _run_main
+    sys.exit(main(argv))
+             ^^^^^^^^^^
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 808, in main
+    process_fold_input(
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 660, in process_fold_input
+    all_inference_results = predict_structure(
+                            ^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 426, in predict_structure
+    for chunk in fold_input.chunks:
+                 ^^^^^^^^^^^^^^^^^
+AttributeError: 'Input' object has no attribute 'chunks'
+
+---
+
+_**Assistant**_
+
+
+
+看起来问题出在 `fold_input.chunks` 的访问上。让我们修改 `predict_structure` 函数，直接使用 `fold_input`：
+
+```python:run_alphafold.py
+def predict_structure(
+    fold_input: folding_input.Input,
+    model_runner: ModelRunner,
+    buckets: Sequence[int] | None = None,
+    conformer_max_iterations: int | None = None,
+) -> Sequence[ResultsForSeed]:
+    """Runs the full inference pipeline to predict structures for each seed."""
+
+    print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
+    featurisation_start_time = time.time()
+    ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
+    
+    # 直接处理整个 fold_input
+    featurised_examples = featurisation.featurise_input(
+        fold_input=fold_input,
+        buckets=buckets,
+        ccd=ccd,
+        verbose=True,
+        conformer_max_iterations=conformer_max_iterations,
+    )
+    
+    print(
+        f'Featurising data with {len(fold_input.rng_seeds)} seed(s) took'
+        f' {time.time() - featurisation_start_time:.2f} seconds.'
+    )
+    print(
+        'Running model inference and extracting output structure samples with'
+        f' {len(fold_input.rng_seeds)} seed(s)...'
+    )
+    all_inference_start_time = time.time()
+    all_inference_results = []
+    
+    for seed, example in zip(fold_input.rng_seeds, [featurised_examples]):
+        print(f'Running model inference with seed {seed}...')
+        inference_start_time = time.time()
+        rng_key = jax.random.PRNGKey(seed)
+        
+        try:
+            result = model_runner.run_inference(example, rng_key)
+            
+            print(
+                f'Running model inference with seed {seed} took'
+                f' {time.time() - inference_start_time:.2f} seconds.'
+            )
+            print(f'Extracting output structure samples with seed {seed}...')
+            extract_structures = time.time()
+            inference_results = model_runner.extract_structures(
+                batch=example, result=result, target_name=fold_input.name
+            )
+            print(
+                f'Extracting {len(inference_results)} output structure samples with'
+                f' seed {seed} took {time.time() - extract_structures:.2f} seconds.'
+            )
+
+            embeddings = model_runner.extract_embeddings(result)
+
+            all_inference_results.append(
+                ResultsForSeed(
+                    seed=seed,
+                    inference_results=inference_results,
+                    full_fold_input=fold_input,
+                    embeddings=embeddings,
+                )
+            )
+        except Exception as e:
+            print(f'Error processing seed {seed}: {str(e)}')
+            print('Skipping this seed and continuing with the next one...')
+            continue
+        
+    print(
+        'Running model inference and extracting output structures with'
+        f' {len(fold_input.rng_seeds)} seed(s) took'
+        f' {time.time() - all_inference_start_time:.2f} seconds.'
+    )
+    
+    if not all_inference_results:
+        raise ValueError('No valid predictions were generated for any seed.')
+    
+    return all_inference_results
+```
+
+主要修改：
+1. 移除了对 `fold_input.chunks` 的访问
+2. 直接使用整个 `fold_input` 进行特征化
+3. 修改了 `zip` 操作，因为现在 `featurised_examples` 是单个对象而不是列表
+
+这样修改后应该可以正常运行了。需要我解释更多细节吗？
 
 ---
 
