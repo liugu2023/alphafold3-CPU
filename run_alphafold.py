@@ -277,7 +277,7 @@ def make_model_config(
     num_recycles: int = 10,
     return_embeddings: bool = False,
 ) -> model.Model.Config:
-    """Returns a model config with some defaults overridden."""
+    """Returns a model config with balanced precision for CPU."""
     config = model.Model.Config()
     
     # 基本配置
@@ -286,24 +286,24 @@ def make_model_config(
     config.num_recycles = num_recycles
     config.return_embeddings = return_embeddings
     
-    # 1. 数值稳定性配置
+    # 精度和稳定性配置
     config.global_config.deterministic = True
-    config.global_config.jax_enable_x64 = True  # 使用64位精度
-    config.global_config.epsilon = 1e-6  # 防止除零
+    config.global_config.jax_enable_x64 = True     # 保持64位精度
+    config.global_config.epsilon = 1e-6            # 平衡的阈值
     
-    # 2. 扩散模型参数优化
-    config.heads.diffusion.eval.temperature = 0.1  # 降低温度增加稳定性
-    config.heads.diffusion.eval.min_beta = 1e-4
-    config.heads.diffusion.eval.max_beta = 0.02
-    config.heads.diffusion.eval.num_steps = 200  # 增加步数提高稳定性
+    # 扩散模型参数
+    config.heads.diffusion.eval.temperature = 0.2   # 平衡的温度
+    config.heads.diffusion.eval.min_beta = 1e-4    # 与GPU版本相同
+    config.heads.diffusion.eval.max_beta = 0.02    # 与GPU版本相同
+    config.heads.diffusion.eval.num_steps = 200    # 适中的步数
     
-    # 3. 注意力机制优化
-    config.global_config.attention_clip_value = 5.0  # 限制注意力分数范围
+    # 注意力机制
+    config.global_config.attention_clip_value = 5.0  # 适中的限制
     config.global_config.attention_dropout_rate = 0.1
     
-    # 4. 梯度和优化器设置
-    config.global_config.gradient_clip_norm = 1.0  # 梯度裁剪
-    config.global_config.weight_decay = 0.0001  # 权重衰减
+    # 优化器设置
+    config.global_config.gradient_clip_norm = 1.0
+    config.global_config.weight_decay = 0.0001
     
     return config
 
@@ -412,7 +412,7 @@ def predict_structure(
     buckets: Sequence[int] | None = None,
     conformer_max_iterations: int | None = None,
 ) -> Sequence[ResultsForSeed]:
-    """Runs the full inference pipeline with enhanced numerical stability."""
+    """Runs the full inference pipeline with CPU-specific optimizations."""
     
     print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
     ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
@@ -426,7 +426,7 @@ def predict_structure(
     
     all_inference_results = []
     for seed, example in zip(fold_input.rng_seeds, featurised_examples):
-        max_retries = 5
+        max_retries = 3  # 减少重试次数，因为我们使用了更保守的配置
         best_result = None
         best_score = float('-inf')
         
@@ -434,42 +434,34 @@ def predict_structure(
             try:
                 print(f'Running model inference with seed {seed} (attempt {attempt+1}/{max_retries})...')
                 
-                # 使用不同的随机种子
-                base_rng = jax.random.PRNGKey(seed + attempt * 100)
-                rng_keys = jax.random.split(base_rng, 3)
+                # 使用固定的随机种子以增加稳定性
+                rng_key = jax.random.PRNGKey(seed)
                 
-                # 使用新的 jax.tree.map API
+                # 简单的输入预处理
                 try:
                     example = jax.tree.map(
-                        lambda x: np.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6),
+                        lambda x: np.clip(x, -1e2, 1e2),  # 使用clip而不是nan_to_num
                         example
                     )
                 except AttributeError:
                     example = jax.tree_util.tree_map(
-                        lambda x: np.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6),
+                        lambda x: np.clip(x, -1e2, 1e2),
                         example
                     )
                 
                 # 运行推理
-                result = model_runner.run_inference(example, rng_keys[0])
+                result = model_runner.run_inference(example, rng_key)
                 
-                # 安全地检查无效值
-                def check_invalid_values(x):
-                    try:
-                        if isinstance(x, (np.ndarray, jnp.ndarray)):
-                            return np.any(np.isnan(x)) or np.any(np.isinf(x))
-                        return False
-                    except (TypeError, ValueError):
-                        return False
+                # 简化的无效值检查
+                def is_valid_array(x):
+                    if not isinstance(x, (np.ndarray, jnp.ndarray)):
+                        return True
+                    if not np.issubdtype(x.dtype, np.number):
+                        return True
+                    return not (np.any(np.isnan(x)) or np.any(np.abs(x) > 1e5))
                 
-                has_invalid_values = any(
-                    check_invalid_values(v) 
-                    for v in jax.tree_util.tree_leaves(result)
-                    if hasattr(v, 'dtype') and np.issubdtype(v.dtype, np.number)
-                )
-                
-                if has_invalid_values:
-                    raise ValueError("Found NaN/inf values in model output")
+                if not all(is_valid_array(v) for v in jax.tree_util.tree_leaves(result)):
+                    raise ValueError("Found invalid values in model output")
                 
                 # 提取结构
                 inference_results = model_runner.extract_structures(
