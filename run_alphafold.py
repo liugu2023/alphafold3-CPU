@@ -426,7 +426,7 @@ def predict_structure(
     
     all_inference_results = []
     for seed, example in zip(fold_input.rng_seeds, featurised_examples):
-        max_retries = 5  # 增加重试次数
+        max_retries = 5
         best_result = None
         best_score = float('-inf')
         
@@ -434,21 +434,41 @@ def predict_structure(
             try:
                 print(f'Running model inference with seed {seed} (attempt {attempt+1}/{max_retries})...')
                 
-                # 使用不同的随机种子和缩放因子
+                # 使用不同的随机种子
                 base_rng = jax.random.PRNGKey(seed + attempt * 100)
-                rng_keys = jax.random.split(base_rng, 3)  # 生成多个随机键
+                rng_keys = jax.random.split(base_rng, 3)
                 
-                # 添加数值稳定性检查
-                example = jax.tree_map(
-                    lambda x: np.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6),
-                    example
-                )
+                # 使用新的 jax.tree.map API
+                try:
+                    example = jax.tree.map(
+                        lambda x: np.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6),
+                        example
+                    )
+                except AttributeError:
+                    example = jax.tree_util.tree_map(
+                        lambda x: np.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6),
+                        example
+                    )
                 
                 # 运行推理
                 result = model_runner.run_inference(example, rng_keys[0])
                 
-                # 检查结果中的无效值
-                if any(np.any(np.isnan(v) | np.isinf(v)) for v in jax.tree_util.tree_leaves(result)):
+                # 安全地检查无效值
+                def check_invalid_values(x):
+                    try:
+                        if isinstance(x, (np.ndarray, jnp.ndarray)):
+                            return np.any(np.isnan(x)) or np.any(np.isinf(x))
+                        return False
+                    except (TypeError, ValueError):
+                        return False
+                
+                has_invalid_values = any(
+                    check_invalid_values(v) 
+                    for v in jax.tree_util.tree_leaves(result)
+                    if hasattr(v, 'dtype') and np.issubdtype(v.dtype, np.number)
+                )
+                
+                if has_invalid_values:
                     raise ValueError("Found NaN/inf values in model output")
                 
                 # 提取结构
@@ -478,7 +498,7 @@ def predict_structure(
             except ValueError as e:
                 if attempt < max_retries - 1:
                     print(f"Encountered error: {str(e)}, retrying... ({attempt+1}/{max_retries})")
-                    time.sleep(1)  # 添加短暂延迟
+                    time.sleep(1)
                     continue
                 else:
                     print(f"Failed after {max_retries} attempts with seed {seed}")

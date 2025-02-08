@@ -1357,6 +1357,322 @@ python run_alphafold.py \
 
 ---
 
+_**User**_
+
+(alphafold-CPU) liugu@login:~/alphafold3-CPU$ python run_alphafold.py \
+  --input_dir=/archive/liugu/iutput/processed \
+  --output_dir=/archive/liugu/output \
+  --model_dir=/archive/liugu/model \
+  --db_dir=/archive/plato/task3/database \
+  --flash_attention_implementation=xla \
+  --num_recycles=3 \
+  --num_diffusion_samples=2 \
+  --conformer_max_iterations=50 \
+  --jackhmmer_n_cpu=8 \
+  --nhmmer_n_cpu=8
+I0208 11:47:04.251955 140609332602048 xla_bridge.py:895] Unable to initialize backend 'rocm': module 'jaxlib.xla_extension' has no attribute 'GpuAllocatorConfig'
+I0208 11:47:04.252699 140609332602048 xla_bridge.py:895] Unable to initialize backend 'tpu': INTERNAL: Failed to open libtpu.so: libtpu.so: cannot open shared object file: No such file or directory
+Using CPU device: TFRT_CPU_0
+Building model from scratch...
+Checking that model parameters can be loaded...
+Done running 0 fold jobs.
+
+---
+
+_**Assistant**_
+
+
+
+看起来程序没有处理任何输入文件。这可能是因为输入路径有误：`/archive/liugu/iutput/processed`（注意这里的"iutput"可能是拼写错误）。
+
+让我们检查一下：
+
+1. 首先确认输入目录路径是否正确：
+```bash
+# 检查目录是否存在
+ls /archive/liugu/iutput/processed
+# 或者
+ls /archive/liugu/input/processed  # 正确的拼写
+```
+
+2. 检查输入目录中是否有正确格式的文件：
+```bash
+# 查看目录内容
+ls -l /archive/liugu/input/processed/*.json
+```
+
+3. 修改运行命令（假设正确路径是 input）：
+```bash
+python run_alphafold.py \
+  --input_dir=/archive/liugu/input/processed \  # 修正拼写错误
+  --output_dir=/archive/liugu/output \
+  --model_dir=/archive/liugu/model \
+  --db_dir=/archive/plato/task3/database \
+  --flash_attention_implementation=xla \
+  --num_recycles=3 \
+  --num_diffusion_samples=2 \
+  --conformer_max_iterations=50 \
+  --jackhmmer_n_cpu=8 \
+  --nhmmer_n_cpu=8
+```
+
+4. 如果目录存在但程序仍然没有处理任何文件，可以添加调试信息：
+
+```python:run_alphafold.py
+def main(_):
+    # ... existing code ...
+
+    if _INPUT_DIR.value is not None:
+        print(f"Looking for input files in: {_INPUT_DIR.value}")
+        fold_inputs = folding_input.load_fold_inputs_from_dir(
+            pathlib.Path(_INPUT_DIR.value)
+        )
+        print(f"Found {len(list(fold_inputs))} input files")
+    elif _JSON_PATH.value is not None:
+        print(f"Loading input from: {_JSON_PATH.value}")
+        fold_inputs = folding_input.load_fold_inputs_from_path(
+            pathlib.Path(_JSON_PATH.value)
+        )
+    else:
+        raise AssertionError(
+            'Exactly one of --json_path or --input_dir must be specified.'
+        )
+
+    # ... rest of the code ...
+```
+
+请确认：
+1. 输入目录路径是否正确
+2. 目录中是否有正确格式的输入文件
+3. 文件权限是否正确
+4. 文件格式是否符合要求（应该是JSON格式）
+
+---
+
+_**User**_
+
+python run_alphafold.py \  --json_path=/archive/liugu/input/processed/37aa_2JO9.json \  --output_dir=/archive/liugu/output \  --model_dir=/archive/liugu/model \  --db_dir=/archive/plato/task3/database \  --flash_attention_implementation=xla \  --num_recycles=3 \  --num_diffusion_samples=2 \  --conformer_max_iterations=50 \  --jackhmmer_n_cpu=8 \  --nhmmer_n_cpu=8
+
+---
+
+_**Assistant**_
+
+
+
+我注意到您的命令中有一些格式问题。反斜线后面有额外的空格，这可能会导致命令解析错误。让我帮您重新格式化命令：
+
+```bash
+python run_alphafold.py \
+--json_path=/archive/liugu/input/processed/37aa_2JO9.json \
+--output_dir=/archive/liugu/output \
+--model_dir=/archive/liugu/model \
+--db_dir=/archive/plato/task3/database \
+--flash_attention_implementation=xla \
+--num_recycles=3 \
+--num_diffusion_samples=2 \
+--conformer_max_iterations=50 \
+--jackhmmer_n_cpu=8 \
+--nhmmer_n_cpu=8
+```
+
+或者写成一行（如果您不想使用反斜线）：
+
+```bash
+python run_alphafold.py --json_path=/archive/liugu/input/processed/37aa_2JO9.json --output_dir=/archive/liugu/output --model_dir=/archive/liugu/model --db_dir=/archive/plato/task3/database --flash_attention_implementation=xla --num_recycles=3 --num_diffusion_samples=2 --conformer_max_iterations=50 --jackhmmer_n_cpu=8 --nhmmer_n_cpu=8
+```
+
+主要修改：
+1. 移除了反斜线后的额外空格
+2. 修正了命令格式
+
+另外，为了确保输入文件存在，您可以先检查：
+
+```bash
+# 检查输入文件是否存在
+ls -l /archive/liugu/input/processed/37aa_2JO9.json
+
+# 检查文件权限
+cat /archive/liugu/input/processed/37aa_2JO9.json | head -n 5
+```
+
+这样可以确保：
+1. 文件路径是正确的
+2. 文件是可读的
+3. 文件内容是有效的JSON格式
+
+---
+
+_**User**_
+
+/archive/liugu/alphafold3-CPU/run_alphafold.py:442: DeprecationWarning: jax.tree_map is deprecated: use jax.tree.map (jax v0.4.25 or newer) or jax.tree_util.tree_map (any JAX version).
+  example = jax.tree_map(
+
+---
+
+_**Assistant**_
+
+
+
+这是一个关于JAX API变更的警告。让我们更新代码以使用新的API：
+
+```python:run_alphafold.py
+def predict_structure(
+    fold_input: folding_input.Input,
+    model_runner: ModelRunner,
+    buckets: Sequence[int] | None = None,
+    conformer_max_iterations: int | None = None,
+) -> Sequence[ResultsForSeed]:
+    """Runs the full inference pipeline with enhanced numerical stability."""
+    
+    print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
+    ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
+    featurised_examples = featurisation.featurise_input(
+        fold_input=fold_input,
+        buckets=buckets,
+        ccd=ccd,
+        verbose=True,
+        conformer_max_iterations=conformer_max_iterations,
+    )
+    
+    all_inference_results = []
+    for seed, example in zip(fold_input.rng_seeds, featurised_examples):
+        max_retries = 5
+        best_result = None
+        best_score = float('-inf')
+        
+        for attempt in range(max_retries):
+            try:
+                print(f'Running model inference with seed {seed} (attempt {attempt+1}/{max_retries})...')
+                
+                # 使用不同的随机种子和缩放因子
+                base_rng = jax.random.PRNGKey(seed + attempt * 100)
+                rng_keys = jax.random.split(base_rng, 3)
+                
+                # 使用新的 jax.tree.map API 替代废弃的 jax.tree_map
+                try:
+                    # 尝试使用新API (jax v0.4.25+)
+                    example = jax.tree.map(
+                        lambda x: np.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6),
+                        example
+                    )
+                except AttributeError:
+                    # 如果新API不可用，使用tree_util (任何JAX版本)
+                    example = jax.tree_util.tree_map(
+                        lambda x: np.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6),
+                        example
+                    )
+                
+                # ... rest of the code ...
+```
+
+这个修改：
+
+1. 使用新的API优先级：
+   - 首选 `jax.tree.map` (JAX v0.4.25+)
+   - 备选 `jax.tree_util.tree_map` (所有JAX版本)
+
+2. 添加了错误处理以确保兼容性
+
+3. 保持了原有的功能不变
+
+这样可以：
+1. 消除废弃警告
+2. 保持向前和向后兼容性
+3. 不影响程序功能
+
+警告消除后，您可以更清晰地看到程序的其他输出信息。
+
+---
+
+_**User**_
+
+I0208 11:48:25.401350 139881852028096 xla_bridge.py:895] Unable to initialize backend 'rocm': module 'jaxlib.xla_extension' has no attribute 'GpuAllocatorConfig'
+I0208 11:48:25.402298 139881852028096 xla_bridge.py:895] Unable to initialize backend 'tpu': INTERNAL: Failed to open libtpu.so: libtpu.so: cannot open shared object file: No such file or directory
+Using CPU device: TFRT_CPU_0
+Building model from scratch...
+Checking that model parameters can be loaded...
+
+Running fold job 37aa_2JO9...
+Output will be written in /archive/liugu/output/37aa_2jo9_20250208_114828 since /archive/liugu/output/37aa_2jo9 is non-empty.
+Running data pipeline...
+Processing chain A
+I0208 11:48:28.131597 139881852028096 pipeline.py:474] Skipping MSA and template search for protein chain A because it already has MSAs and templates.
+Processing chain A took 0.00 seconds
+Writing model input JSON to /archive/liugu/output/37aa_2jo9_20250208_114828/37aa_2jo9_data.json
+Predicting 3D structure for 37aa_2JO9 with 1 seed(s)...
+Featurising data with 1 seed(s)...
+Featurising data with seed 1.
+I0208 11:48:32.785179 139881852028096 pipeline.py:164] processing 37aa_2JO9, random_seed=1
+I0208 11:48:32.794712 139881852028096 pipeline.py:257] Calculating bucket size for input with 37 tokens.
+I0208 11:48:32.794911 139881852028096 pipeline.py:263] Got bucket size 256 for input with 37 tokens, resulting in 219 padded tokens.
+Featurising data with seed 1 took 0.62 seconds.
+Running model inference with seed 1 (attempt 1/5)...
+/archive/liugu/alphafold3-CPU/run_alphafold.py:442: DeprecationWarning: jax.tree_map is deprecated: use jax.tree.map (jax v0.4.25 or newer) or jax.tree_util.tree_map (any JAX version).
+  example = jax.tree_map(
+Traceback (most recent call last):
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 785, in <module>
+    app.run(main)
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/absl/app.py", line 308, in run
+    _run_main(main, args)
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/absl/app.py", line 254, in _run_main
+    sys.exit(main(argv))
+             ^^^^^^^^^^
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 770, in main
+    process_fold_input(
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 660, in process_fold_input
+    all_inference_results = predict_structure(
+                            ^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 451, in predict_structure
+    if any(np.any(np.isnan(v) | np.isinf(v)) for v in jax.tree_util.tree_leaves(result)):
+       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 451, in <genexpr>
+    if any(np.any(np.isnan(v) | np.isinf(v)) for v in jax.tree_util.tree_leaves(result)):
+                  ^^^^^^^^^^^
+TypeError: ufunc 'isnan' not supported for the input types, and the inputs could not be safely coerced to any supported types according to the casting rule ''safe''
+
+---
+
+_**Assistant**_
+
+
+
+这个错误表明在检查NaN值时遇到了类型不兼容的问题。让我们修改代码来更安全地处理不同类型的数据：
+
+```python:run_alphafold.py
+def predict_structure(
+    fold_input: folding_input.Input,
+    model_runner: ModelRunner,
+    buckets: Sequence[int] | None = None,
+    conformer_max_iterations: int | None = None,
+) -> Sequence[ResultsForSeed]:
+    """Runs the full inference pipeline with enhanced numerical stability."""
+    
+    print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
+    ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
+    featurised_examples = featurisation.featurise_input(
+        fold_input=fold_input,
+        buckets=buckets,
+        ccd=ccd,
+        verbose=True,
+        conformer_max_iterations=conformer_max_iterations,
+    )
+    
+    all_inference_results = []
+    for seed, example in zip(fold_input.rng_seeds, featurised_examples):
+        max_retries = 5
+        best_result = None
+        best_score = float('-inf')
+        
+        for attempt in range(max_retries):
+            try:
+                print(f'Running model inference with seed {seed} (attempt {attempt+1}/{max_retries})...')
+                
+                # 使用不同的随机种子
+                base_rng = jax.random.PRNGKey(seed + attempt * 100)
+                r
+
+---
+
 
 
 ---
