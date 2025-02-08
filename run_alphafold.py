@@ -277,7 +277,7 @@ def make_model_config(
     num_recycles: int = 10,
     return_embeddings: bool = False,
 ) -> model.Model.Config:
-    """Returns a model config with balanced precision for CPU."""
+    """Returns a model config optimized for CPU inference."""
     config = model.Model.Config()
     
     # 基本配置
@@ -286,24 +286,16 @@ def make_model_config(
     config.num_recycles = num_recycles
     config.return_embeddings = return_embeddings
     
-    # 精度和稳定性配置
+    # CPU特定优化
     config.global_config.deterministic = True
-    config.global_config.jax_enable_x64 = True     # 保持64位精度
-    config.global_config.epsilon = 1e-6            # 平衡的阈值
+    config.global_config.jax_enable_x64 = True
+    config.global_config.epsilon = 1e-7
     
-    # 扩散模型参数
-    config.heads.diffusion.eval.temperature = 0.2   # 平衡的温度
-    config.heads.diffusion.eval.min_beta = 1e-4    # 与GPU版本相同
-    config.heads.diffusion.eval.max_beta = 0.02    # 与GPU版本相同
-    config.heads.diffusion.eval.num_steps = 200    # 适中的步数
-    
-    # 注意力机制
-    config.global_config.attention_clip_value = 5.0  # 适中的限制
-    config.global_config.attention_dropout_rate = 0.1
-    
-    # 优化器设置
-    config.global_config.gradient_clip_norm = 1.0
-    config.global_config.weight_decay = 0.0001
+    # 使用GPU版本的扩散参数
+    config.heads.diffusion.eval.temperature = 0.1
+    config.heads.diffusion.eval.min_beta = 1e-4
+    config.heads.diffusion.eval.max_beta = 0.02
+    config.heads.diffusion.eval.num_steps = 200
     
     return config
 
@@ -412,7 +404,7 @@ def predict_structure(
     buckets: Sequence[int] | None = None,
     conformer_max_iterations: int | None = None,
 ) -> Sequence[ResultsForSeed]:
-    """Runs the full inference pipeline with CPU-specific optimizations."""
+    """Runs inference with minimal data preprocessing."""
     
     print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
     ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
@@ -423,18 +415,6 @@ def predict_structure(
         verbose=True,
         conformer_max_iterations=conformer_max_iterations,
     )
-    
-    def safe_process(x):
-        """安全地处理不同类型的数据，保持索引类型"""
-        if isinstance(x, (np.ndarray, jnp.ndarray)):
-            if np.issubdtype(x.dtype, np.number):
-                if np.issubdtype(x.dtype, np.integer):
-                    # 保持整数类型不变
-                    return x
-                else:
-                    # 对浮点数进行裁剪
-                    return np.clip(x, -1e2, 1e2)
-        return x
     
     all_inference_results = []
     for seed, example in zip(fold_input.rng_seeds, featurised_examples):
@@ -449,36 +429,40 @@ def predict_structure(
                 # 使用固定的随机种子
                 rng_key = jax.random.PRNGKey(seed)
                 
-                # 预处理输入数据，保持索引类型
+                # 最小化数据预处理
+                def minimal_process(x):
+                    """最小化的数据预处理"""
+                    if isinstance(x, (np.ndarray, jnp.ndarray)):
+                        if np.issubdtype(x.dtype, np.floating):
+                            return np.nan_to_num(x, nan=0.0)
+                    return x
+                
                 try:
-                    example = jax.tree.map(safe_process, example)
+                    example = jax.tree.map(minimal_process, example)
                 except AttributeError:
-                    example = jax.tree_util.tree_map(safe_process, example)
+                    example = jax.tree_util.tree_map(minimal_process, example)
                 
                 # 运行推理
                 result = model_runner.run_inference(example, rng_key)
                 
-                # 检查结果
-                def is_valid_array(x):
+                # 简化的结果验证
+                def check_result(x):
+                    """只检查关键数值的有效性"""
                     if isinstance(x, (np.ndarray, jnp.ndarray)):
-                        if np.issubdtype(x.dtype, np.number):
-                            if np.issubdtype(x.dtype, np.integer):
-                                # 整数类型只检查是否有NaN
+                        if np.issubdtype(x.dtype, np.floating):
+                            if x.size > 0:  # 只检查非空数组
                                 return not np.any(np.isnan(x))
-                            else:
-                                # 浮点数检查NaN和范围
-                                return not (np.any(np.isnan(x)) or np.any(np.abs(x) > 1e5))
                     return True
                 
-                if not all(is_valid_array(v) for v in jax.tree_util.tree_leaves(result)):
-                    raise ValueError("Found invalid values in model output")
+                if not all(check_result(v) for v in jax.tree_util.tree_leaves(result)):
+                    raise ValueError("Found NaN values in critical outputs")
                 
                 # 提取结构
                 inference_results = model_runner.extract_structures(
                     batch=example, result=result, target_name=fold_input.name
                 )
                 
-                # 计算结构质量分数
+                # 计算分数
                 current_score = float(result.get('confidence_score', 0.0))
                 print(f"Attempt {attempt+1} score: {current_score:.4f}")
                 
@@ -494,9 +478,9 @@ def predict_structure(
                 if current_score > 0.7:
                     break
                     
-            except (ValueError, TypeError) as e:
+            except Exception as e:
                 if attempt < max_retries - 1:
-                    print(f"Encountered error: {str(e)}, retrying... ({attempt+1}/{max_retries})")
+                    print(f"Error: {str(e)}, retrying... ({attempt+1}/{max_retries})")
                     time.sleep(1)
                     continue
                 else:

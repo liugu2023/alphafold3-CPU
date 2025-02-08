@@ -2607,7 +2607,100 @@ def predict_structure(
                 
                 # 提取结构
                 inference_results = model_runner.extract_structures(
-                    batch=example, result=result, target
+                    batch=example, result=result, target_name=fold_input.name
+                )
+                
+                # 计算结构质量分数
+                current_score = float(result.get('confidence_score', 0.0))
+                print(f"Attempt {attempt+1} score: {current_score:.4f}")
+                
+                if current_score > best_score:
+                    best_score = current_score
+                    best_result = ResultsForSeed(
+                        seed=seed,
+                        inference_results=inference_results,
+                        full_fold_input=fold_input,
+                        embeddings=model_runner.extract_embeddings(result),
+                    )
+                
+                if current_score > 0.7:
+                    break
+                    
+            except (ValueError, TypeError) as e:
+                if attempt < max_retries - 1:
+                    print(f"Encountered error: {str(e)}, retrying... ({attempt+1}/{max_retries})")
+                    time.sleep(1)
+                    continue
+                else:
+                    print(f"Failed after {max_retries} attempts with seed {seed}")
+                    raise
+        
+        if best_result is not None:
+            print(f"Best score for seed {seed}: {best_score:.4f}")
+            all_inference_results.append(best_result)
+        else:
+            print(f"Warning: No valid results for seed {seed}")
+    
+    return all_inference_results
+```
+
+
+主要修改：
+
+1. 改进了`safe_process`函数以区分整数和浮点数：
+```python
+def safe_process(x):
+    if isinstance(x, (np.ndarray, jnp.ndarray)):
+        if np.issubdtype(x.dtype, np.number):
+            if np.issubdtype(x.dtype, np.integer):
+                return x  # 保持整数类型不变
+            else:
+                return np.clip(x, -1e2, 1e2)
+    return x
+```
+
+
+2. 改进了有效性检查函数：
+```python
+def is_valid_array(x):
+    if isinstance(x, (np.ndarray, jnp.ndarray)):
+        if np.issubdtype(x.dtype, np.number):
+            if np.issubdtype(x.dtype, np.integer):
+                return not np.any(np.isnan(x))
+            else:
+                return not (np.any(np.isnan(x)) or np.any(np.abs(x) > 1e5))
+    return True
+```
+
+
+3. 扩展了错误捕获：
+```python
+except (ValueError, TypeError) as e:
+```
+
+
+这些修改应该能解决索引类型的问题，同时保持数值稳定性。
+
+---
+
+_**User**_
+
+Traceback (most recent call last):
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 804, in <module>
+    app.run(main)
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/absl/app.py", line 308, in run
+    _run_main(main, args)
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/absl/app.py", line 254, in _run_main
+    sys.exit(main(argv))
+             ^^^^^^^^^^
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 789, in main
+    process_fold_input(
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 679, in process_fold_input
+    all_inference_results = predict_structure(
+                            ^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 474, in predict_structure
+    raise ValueError("Found invalid values in model output")
+ValueError: Found invalid values in model output
 
 ---
 
