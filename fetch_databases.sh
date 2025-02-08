@@ -25,12 +25,10 @@ mkdir -p "${db_dir}"
 readonly SOURCE=https://storage.googleapis.com/alphafold-databases/v3.0
 
 echo "Start Fetching and Untarring 'pdb_2022_09_28_mmcif_files.tar'"
-wget --progress=bar:force --show-progress --output-document=- \
+wget --quiet --output-document=- \
     "${SOURCE}/pdb_2022_09_28_mmcif_files.tar.zst" | \
     tar --no-same-owner --no-same-permissions \
     --use-compress-program=zstd -xf - --directory="${db_dir}" &
-
-pids=()
 
 for NAME in mgy_clusters_2022_05.fa \
             bfd-first_non_consensus_sequences.fasta \
@@ -40,18 +38,9 @@ for NAME in mgy_clusters_2022_05.fa \
             nt_rna_2023_02_23_clust_seq_id_90_cov_80_rep_seq.fasta \
             rfam_14_9_clust_seq_id_90_cov_80_rep_seq.fasta ; do
   echo "Start Fetching '${NAME}'"
-  (
-    wget --progress=bar:force --show-progress --output-document=- \
-        "${SOURCE}/${NAME}.zst" | \
-        zstd --decompress > "${db_dir}/${NAME}"
-    echo "Completed downloading and decompressing '${NAME}'"
-  ) &
-  pids+=($!)
+  wget --quiet --output-document=- "${SOURCE}/${NAME}.zst" | \
+      zstd --decompress > "${db_dir}/${NAME}" &
 done
 
-for pid in "${pids[@]}"; do
-  wait $pid
-done
-
-echo "All downloads completed successfully!"
-echo "Databases have been downloaded to: ${db_dir}"
+wait
+echo "Complete"

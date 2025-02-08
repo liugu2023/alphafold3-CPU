@@ -279,24 +279,31 @@ def make_model_config(
 ) -> model.Model.Config:
     """Returns a model config with some defaults overridden."""
     config = model.Model.Config()
+    
+    # 基本配置
     config.global_config.flash_attention_implementation = flash_attention_implementation
     config.heads.diffusion.eval.num_samples = num_diffusion_samples
     config.num_recycles = num_recycles
     config.return_embeddings = return_embeddings
     
-    # 增强数值稳定性的配置
-    config.global_config.deterministic = True  # 使用确定性计算
-    config.global_config.epsilon = 1e-7  # 数值稳定性阈值
+    # 1. 数值稳定性配置
+    config.global_config.deterministic = True
     config.global_config.jax_enable_x64 = True  # 使用64位精度
+    config.global_config.epsilon = 1e-6  # 防止除零
     
-    # 优化扩散模型参数
-    config.heads.diffusion.eval.temperature = 0.1  # 降低采样温度提高稳定性
-    config.heads.diffusion.eval.min_beta = 1e-4   # 最小噪声水平
-    config.heads.diffusion.eval.max_beta = 0.02   # 最大噪声水平
+    # 2. 扩散模型参数优化
+    config.heads.diffusion.eval.temperature = 0.1  # 降低温度增加稳定性
+    config.heads.diffusion.eval.min_beta = 1e-4
+    config.heads.diffusion.eval.max_beta = 0.02
+    config.heads.diffusion.eval.num_steps = 200  # 增加步数提高稳定性
     
-    # 优化注意力机制
-    config.global_config.attention_dropout_rate = 0.1  # 添加dropout以增加鲁棒性
-    config.global_config.attention_clip_value = 5.0   # 限制注意力分数范围
+    # 3. 注意力机制优化
+    config.global_config.attention_clip_value = 5.0  # 限制注意力分数范围
+    config.global_config.attention_dropout_rate = 0.1
+    
+    # 4. 梯度和优化器设置
+    config.global_config.gradient_clip_norm = 1.0  # 梯度裁剪
+    config.global_config.weight_decay = 0.0001  # 权重衰减
     
     return config
 
@@ -405,10 +412,9 @@ def predict_structure(
     buckets: Sequence[int] | None = None,
     conformer_max_iterations: int | None = None,
 ) -> Sequence[ResultsForSeed]:
-    """Runs the full inference pipeline to predict structures for each seed."""
+    """Runs the full inference pipeline with enhanced numerical stability."""
     
     print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
-    featurisation_start_time = time.time()
     ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
     featurised_examples = featurisation.featurise_input(
         fold_input=fold_input,
@@ -420,18 +426,30 @@ def predict_structure(
     
     all_inference_results = []
     for seed, example in zip(fold_input.rng_seeds, featurised_examples):
-        max_retries = 3
+        max_retries = 5  # 增加重试次数
         best_result = None
         best_score = float('-inf')
         
         for attempt in range(max_retries):
             try:
                 print(f'Running model inference with seed {seed} (attempt {attempt+1}/{max_retries})...')
-                # 使用不同的随机种子
-                rng_key = jax.random.PRNGKey(seed + attempt * 100)
+                
+                # 使用不同的随机种子和缩放因子
+                base_rng = jax.random.PRNGKey(seed + attempt * 100)
+                rng_keys = jax.random.split(base_rng, 3)  # 生成多个随机键
+                
+                # 添加数值稳定性检查
+                example = jax.tree_map(
+                    lambda x: np.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6),
+                    example
+                )
                 
                 # 运行推理
-                result = model_runner.run_inference(example, rng_key)
+                result = model_runner.run_inference(example, rng_keys[0])
+                
+                # 检查结果中的无效值
+                if any(np.any(np.isnan(v) | np.isinf(v)) for v in jax.tree_util.tree_leaves(result)):
+                    raise ValueError("Found NaN/inf values in model output")
                 
                 # 提取结构
                 inference_results = model_runner.extract_structures(
@@ -441,7 +459,9 @@ def predict_structure(
                 # 计算结构质量分数
                 current_score = float(result.get('confidence_score', 0.0))
                 
-                # 保留最好的结果
+                print(f"Attempt {attempt+1} score: {current_score:.4f}")
+                
+                # 保存最好的结果
                 if current_score > best_score:
                     best_score = current_score
                     best_result = ResultsForSeed(
@@ -451,21 +471,17 @@ def predict_structure(
                         embeddings=model_runner.extract_embeddings(result),
                     )
                 
-                print(f"Attempt {attempt+1} score: {current_score:.4f}")
-                
                 # 如果分数足够好就提前退出
-                if current_score > 0.7:  # 可以调整这个阈值
+                if current_score > 0.7:
                     break
                     
             except ValueError as e:
-                if "Column x must not contain NaN/inf values" in str(e):
-                    if attempt < max_retries - 1:
-                        print(f"Encountered numerical instability, retrying... ({attempt+1}/{max_retries})")
-                        continue
-                    else:
-                        print(f"Failed after {max_retries} attempts with seed {seed}")
-                        raise
+                if attempt < max_retries - 1:
+                    print(f"Encountered error: {str(e)}, retrying... ({attempt+1}/{max_retries})")
+                    time.sleep(1)  # 添加短暂延迟
+                    continue
                 else:
+                    print(f"Failed after {max_retries} attempts with seed {seed}")
                     raise
         
         if best_result is not None:

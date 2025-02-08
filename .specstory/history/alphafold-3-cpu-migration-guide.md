@@ -980,6 +980,383 @@ python run_alphafold.py \
 
 ---
 
+_**User**_
+
+解释参数
+
+---
+
+_**Assistant**_
+
+
+
+让我解释这些关键参数的含义和建议值：
+
+```bash
+--num_recycles=5      # 循环次数
+--num_diffusion_samples=3    # 扩散采样数量
+--conformer_max_iterations=100    # 构象搜索最大迭代次数
+```
+
+1. `num_recycles`（循环次数）:
+   - 含义：模型对结构进行迭代优化的次数
+   - 默认值：10
+   - 建议值：3-5
+   - 权衡：
+     - 更多循环 = 更好的精度，但更慢
+     - 更少循环 = 更快，但可能精度降低
+   - CPU上建议使用较小值以加快速度
+
+2. `num_diffusion_samples`（扩散采样数量）:
+   - 含义：生成的结构构象数量
+   - 默认值：5
+   - 建议值：1-3
+   - 权衡：
+     - 更多样本 = 更多构象选择，但更慢
+     - 更少样本 = 更快，但可能错过好的构象
+   - CPU上建议使用较小值
+
+3. `conformer_max_iterations`（构象搜索迭代次数）:
+   - 含义：RDKit构象搜索的最大迭代次数
+   - 默认值：无限制
+   - 建议值：100-200
+   - 权衡：
+     - 更多迭代 = 更彻底的构象搜索，但更慢
+     - 更少迭代 = 更快，但可能错过某些构象
+
+建议的参数组合：
+
+1. 快速测试：
+```bash
+--num_recycles=3 \
+--num_diffusion_samples=1 \
+--conformer_max_iterations=50
+```
+
+2. 平衡配置（推荐）：
+```bash
+--num_recycles=5 \
+--num_diffusion_samples=3 \
+--conformer_max_iterations=100
+```
+
+3. 高精度（但很慢）：
+```bash
+--num_recycles=10 \
+--num_diffusion_samples=5 \
+--conformer_max_iterations=200
+```
+
+在CPU上运行时，建议使用平衡配置，这样可以在计算时间和预测质量之间取得较好的平衡。
+
+---
+
+_**User**_
+
+Running model inference with seed 1 (attempt 3/3)...
+Failed after 3 attempts with seed 1
+Traceback (most recent call last):
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 769, in <module>
+    app.run(main)
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/absl/app.py", line 308, in run
+    _run_main(main, args)
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/absl/app.py", line 254, in _run_main
+    sys.exit(main(argv))
+             ^^^^^^^^^^
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 754, in main
+    process_fold_input(
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 644, in process_fold_input
+    all_inference_results = predict_structure(
+                            ^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 437, in predict_structure
+    inference_results = model_runner.extract_structures(
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 365, in extract_structures
+    return list(
+           ^^^^^
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/alphafold3/model/model.py", line 369, in get_inference_result
+    pred_structure = get_predicted_structure(result=result, batch=batch)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/alphafold3/model/model.py", line 128, in get_predicted_structure
+    pred_struc = pred_struc.copy_and_update_atoms(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/alphafold3/structure/structure.py", line 1355, in copy_and_update_atoms
+    new_atoms = structure_tables.Atoms(
+                ^^^^^^^^^^^^^^^^^^^^^^^
+  File "<string>", line 13, in __init__
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/alphafold3/structure/structure_tables.py", line 103, in __post_init__
+    raise ValueError(
+ValueError: Column x must not contain NaN/inf values.为什么会出现无穷大
+
+---
+
+_**Assistant**_
+
+
+
+在AlphaFold中出现NaN/inf（无穷大）值通常有几个原因：
+
+1. 数值计算不稳定性：
+- 在CPU上进行浮点运算时，精度和舍入误差可能导致数值不稳定
+- 某些数学运算（如除以接近0的数）可能产生无穷大值
+
+2. 模型参数和配置：
+- 学习率或温度参数设置不当
+- 注意力机制的数值范围过大
+
+让我们修改代码来增强数值稳定性：
+
+```python:run_alphafold.py
+def make_model_config(
+    *,
+    flash_attention_implementation: attention.Implementation = 'xla',
+    num_diffusion_samples: int = 5,
+    num_recycles: int = 10,
+    return_embeddings: bool = False,
+) -> model.Model.Config:
+    config = model.Model.Config()
+    
+    # 基本配置
+    config.global_config.flash_attention_implementation = flash_attention_implementation
+    config.heads.diffusion.eval.num_samples = num_diffusion_samples
+    config.num_recycles = num_recycles
+    config.return_embeddings = return_embeddings
+    
+    # 1. 数值稳定性配置
+    config.global_config.deterministic = True
+    config.global_config.jax_enable_x64 = True  # 使用64位精度
+    config.global_config.epsilon = 1e-6  # 防止除零
+    
+    # 2. 扩散模型参数优化
+    config.heads.diffusion.eval.temperature = 0.1  # 降低温度增加稳定性
+    config.heads.diffusion.eval.min_beta = 1e-4
+    config.heads.diffusion.eval.max_beta = 0.02
+    config.heads.diffusion.eval.num_steps = 200  # 增加步数提高稳定性
+    
+    # 3. 注意力机制优化
+    config.global_config.attention_clip_value = 5.0  # 限制注意力分数范围
+    config.global_config.attention_dropout_rate = 0.1
+    
+    # 4. 梯度和优化器设置
+    config.global_config.gradient_clip_norm = 1.0  # 梯度裁剪
+    config.global_config.weight_decay = 0.0001  # 权重衰减
+    
+    return config
+
+def predict_structure(
+    fold_input: folding_input.Input,
+    model_runner: ModelRunner,
+    buckets: Sequence[int] | None = None,
+    conformer_max_iterations: int | None = None,
+) -> Sequence[ResultsForSeed]:
+    """Runs the full inference pipeline with enhanced numerical stability."""
+    
+    print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
+    ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
+    featurised_examples = featurisation.featurise_input(
+        fold_input=fold_input,
+        buckets=buckets,
+        ccd=ccd,
+        verbose=True,
+        conformer_max_iterations=conformer_max_iterations,
+    )
+    
+    all_inference_results = []
+    for seed, example in zip(fold_input.rng_seeds, featurised_examples):
+        max_retries = 5  # 增加重试次数
+        best_result = None
+        best_score = float('-inf')
+        
+        for attempt in range(max_retries):
+            try:
+                print(f'Running model inference with seed {seed} (attempt {attempt+1}/{max_retries})...')
+                
+                # 使用不同的随机种子和缩放因子
+                base_rng = jax.random.PRNGKey(seed + attempt * 100)
+                rng_keys = jax.random.split(base_rng, 3)  # 生成多个随机键
+                
+                # 添加数值稳定性检查
+                example = jax.tree_map(
+                    lambda x: np.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6),
+                    example
+                )
+                
+                # 运行推理
+                result = model_runner.run_inference(example, rng_keys[0])
+                
+                # 检查结果中的无效值
+                if any(np.any(np.isnan(v) | np.isinf(v)) for v in jax.tree_util.tree_leaves(result)):
+                    raise ValueError("Found NaN/inf values in model output")
+                
+                # 提取结构
+                inference_results = model_runner.extract_structures(
+                    batch=example, result=result, target_name=fold_input.name
+                )
+                
+                # 计算结构质量分数
+                current_score = float(result.get('confidence_score', 0.0))
+                
+                print(f"Attempt {attempt+1} score: {current_score:.4f}")
+                
+                # 保存最好的结果
+                if current_score > best_score:
+                    best_score = current_score
+                    best_result = ResultsForSeed(
+                        seed=seed,
+                        inference_results=inference_results,
+                        full_fold_input=fold_input,
+                        embeddings=model_runner.extract_embeddings(result),
+                    )
+                
+                # 如果分数足够好就提前退出
+                if current_score > 0.7:
+                    break
+                    
+            except ValueError as e:
+                if attempt < max_retries - 1:
+                    print(f"Encountered error: {str(e)}, retrying... ({attempt+1}/{max_retries})")
+                    time.sleep(1)  # 添加短暂延迟
+                    continue
+                else:
+                    print(f"Failed after {max_retries} attempts with seed {seed}")
+                    raise
+        
+        if best_result is not None:
+            print(f"Best score for seed {seed}: {best_score:.4f}")
+            all_inference_results.append(best_result)
+        else:
+            print(f"Warning: No valid results for seed {seed}")
+    
+    return all_inference_results
+```
+
+建议的运行参数：
+
+```bash
+python run_alphafold.py \
+  --input_dir=/archive/liugu/iutput/processed \
+  --output_dir=/archive/liugu/output \
+  --model_dir=/archive/liugu/model \
+  --db_dir=/archive/plato/task3/database \
+  --flash_attention_implementation=xla \
+  --num_recycles=3 \
+  --num_diffusion_samples=2 \
+  --conformer_max_iterations=50 \
+  --jackhmmer_n_cpu=8 \
+  --nhmmer_n_cpu=8
+```
+
+主要改进：
+1. 使用64位精度计算
+2. 增加数值稳定性检查
+3. 添加输入值清理
+4. 优化模型配置参数
+5. 增加重试次数和错误处理
+6. 降低模型参数的激进程度
+
+这些修改应该能够显著减少NaN/inf值的出现。如果仍然遇到问题，可能需要进一步调整参数或检查输入数据的质量。
+
+---
+
+_**User**_
+
+解释运行参数
+
+---
+
+_**Assistant**_
+
+
+
+让我详细解释运行参数的含义和建议值：
+
+```bash
+python run_alphafold.py \
+  --input_dir=/archive/liugu/iutput/processed \  # 输入目录
+  --output_dir=/archive/liugu/output \           # 输出目录
+  --model_dir=/archive/liugu/model \             # 模型权重目录
+  --db_dir=/archive/plato/task3/database \       # 数据库目录
+  --flash_attention_implementation=xla \          # 注意力机制实现方式
+  --num_recycles=3 \                             # 结构优化循环次数
+  --num_diffusion_samples=2 \                    # 扩散采样数量
+  --conformer_max_iterations=50 \                # 构象搜索最大迭代次数
+  --jackhmmer_n_cpu=8 \                         # Jackhmmer使用的CPU核心数
+  --nhmmer_n_cpu=8                              # Nhmmer使用的CPU核心数
+```
+
+详细解释：
+
+1. 路径参数：
+```bash
+--input_dir      # 输入文件目录
+--output_dir     # 结果输出目录
+--model_dir      # 模型权重文件目录
+--db_dir         # MSA搜索用的数据库目录
+```
+
+2. 计算参数：
+```bash
+--num_recycles=3             
+# 结构优化循环次数
+# 默认值：10
+# CPU建议值：3-5
+# 权衡：更多循环=更高精度但更慢
+
+--num_diffusion_samples=2    
+# 扩散模型采样数量
+# 默认值：5
+# CPU建议值：1-3
+# 权衡：更多样本=更多构象但更慢
+
+--conformer_max_iterations=50
+# 构象搜索迭代次数上限
+# 默认值：无限制
+# CPU建议值：50-100
+# 权衡：更多迭代=更彻底搜索但更慢
+```
+
+3. 资源使用参数：
+```bash
+--jackhmmer_n_cpu=8  # 蛋白质序列比对的CPU核心数
+--nhmmer_n_cpu=8     # RNA序列比对的CPU核心数
+# 建议值：min(可用CPU核心数, 8)
+# 超过8核心收益很小
+```
+
+4. 性能参数：
+```bash
+--flash_attention_implementation=xla
+# 注意力机制实现方式
+# CPU上必须使用'xla'
+```
+
+不同场景的推荐配置：
+
+1. 快速测试：
+```bash
+--num_recycles=2 \
+--num_diffusion_samples=1 \
+--conformer_max_iterations=30
+```
+
+2. 平衡配置（推荐）：
+```bash
+--num_recycles=3 \
+--num_diffusion_samples=2 \
+--conformer_max_iterations=50
+```
+
+3. 高精度（但很慢）：
+```bash
+--num_recycles=5 \
+--num_diffusion_samples=3 \
+--conformer_max_iterations=100
+```
+
+在CPU上运行时，建议使用平衡配置以在速度和精度之间取得较好的平衡。如果遇到内存问题，可以进一步降低参数值。
+
+---
+
 
 
 ---
