@@ -2180,7 +2180,223 @@ def make_model_config(
     config.heads.diffusion.eval.temperature = 0.2   # 平衡的温度
     config.heads.diffusion.eval.min_beta = 1e-4    # 与GPU版本相同
     config.heads.diffusion.eval.max_beta = 0.02    # 与GPU版本相同
-    config.heads.diffusion.eval.num_
+    config.heads.diffusion.eval.num_steps = 200    # 适中的步数
+    
+    # 注意力机制
+    config.global_config.attention_clip_value = 5.0  # 适中的限制
+    config.global_config.attention_dropout_rate = 0.1
+    
+    # 优化器设置
+    config.global_config.gradient_clip_norm = 1.0
+    config.global_config.weight_decay = 0.0001
+    
+    return config
+```
+
+这个配置：
+1. 保持64位精度以利用CPU的优势
+2. 使用与GPU版本相似的扩散参数
+3. 采用适中的epsilon值(1e-6)平衡精度和稳定性
+4. 其他参数尽量接近GPU版本
+
+运行参数建议：
+```bash
+python run_alphafold.py \
+--json_path=/archive/liugu/input/processed/37aa_2JO9.json \
+--output_dir=/archive/liugu/output \
+--model_dir=/archive/liugu/model \
+--db_dir=/archive/plato/task3/database \
+--flash_attention_implementation=xla \
+--num_recycles=3 \
+--num_diffusion_samples=2 \
+--conformer_max_iterations=50
+```
+
+这样应该能在保持精度的同时提高稳定性。如果还是不稳定，我们可以：
+1. 逐步调整epsilon值
+2. 微调扩散模型参数
+3. 考虑使用混合精度计算
+
+---
+
+_**User**_
+
+将输出重定向到run.log
+
+---
+
+_**Assistant**_
+
+
+
+可以使用以下方式将输出重定向到run.log：
+
+```bash
+# 方法1: 使用 > 重定向标准输出
+python run_alphafold.py \
+--json_path=/archive/liugu/input/processed/37aa_2JO9.json \
+--output_dir=/archive/liugu/output \
+--model_dir=/archive/liugu/model \
+--db_dir=/archive/plato/task3/database \
+--flash_attention_implementation=xla \
+--num_recycles=3 \
+--num_diffusion_samples=2 \
+--conformer_max_iterations=50 > run.log 2>&1
+```
+
+或者
+
+```bash
+# 方法2: 使用 tee 命令同时显示在屏幕和写入文件
+python run_alphafold.py \
+--json_path=/archive/liugu/input/processed/37aa_2JO9.json \
+--output_dir=/archive/liugu/output \
+--model_dir=/archive/liugu/model \
+--db_dir=/archive/plato/task3/database \
+--flash_attention_implementation=xla \
+--num_recycles=3 \
+--num_diffusion_samples=2 \
+--conformer_max_iterations=50 2>&1 | tee run.log
+```
+
+区别：
+1. 第一种方法 (`> run.log 2>&1`)：
+   - 所有输出只写入文件
+   - 屏幕上不显示任何输出
+   - `2>&1` 确保错误信息也被记录
+
+2. 第二种方法 (`2>&1 | tee run.log`)：
+   - 输出同时显示在屏幕上和写入文件
+   - 可以实时查看进度
+   - 也记录错误信息
+
+建议使用第二种方法，这样可以：
+1. 实时监控运行状态
+2. 保存完整日志
+3. 方便调试和问题排查
+
+---
+
+_**User**_
+
+Running model inference with seed 1 (attempt 1/3)...
+Traceback (most recent call last):
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/numpy/core/fromnumeric.py", line 59, in _wrapfunc
+    return bound(*args, **kwds)
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/numpy/core/_methods.py", line 99, in _clip
+    return um.clip(a, min, max, out=out, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: '>=' not supported between instances of 'Structure' and 'float'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 797, in <module>
+    app.run(main)
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/absl/app.py", line 308, in run
+    _run_main(main, args)
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/absl/app.py", line 254, in _run_main
+    sys.exit(main(argv))
+             ^^^^^^^^^^
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 782, in main
+    process_fold_input(
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 672, in process_fold_input
+    all_inference_results = predict_structure(
+                            ^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 442, in predict_structure
+    example = jax.tree.map(
+              ^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/jax/_src/tree.py", line 155, in map
+    return tree_util.tree_map(f, tree, *rest, is_leaf=is_leaf)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/jax/_src/tree_util.py", line 344, in tree_map
+    return treedef.unflatten(f(*xs) for xs in zip(*all_leaves))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/jax/_src/tree_util.py", line 344, in <genexpr>
+    return treedef.unflatten(f(*xs) for xs in zip(*all_leaves))
+                             ^^^^^^
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 443, in <lambda>
+    lambda x: np.clip(x, -1e2, 1e2),  # 使用clip而不是nan_to_num
+              ^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/numpy/core/fromnumeric.py", line 2169, in clip
+    return _wrapfunc(a, 'clip', a_min, a_max, out=out, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/numpy/core/fromnumeric.py", line 68, in _wrapfunc
+    return _wrapit(obj, method, *args, **kwds)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/numpy/core/fromnumeric.py", line 45, in _wrapit
+    result = getattr(asarray(obj), method)(*args, **kwds)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/numpy/core/_methods.py", line 99, in _clip
+    return um.clip(a, min, max, out=out, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: '>=' not supported between instances of 'Structure' and 'float'
+
+---
+
+_**Assistant**_
+
+
+
+这个错误表明我们在尝试对`Structure`类型的数据使用`np.clip`函数，这是不支持的。我们需要修改数值处理逻辑，区分不同类型的数据：
+
+```python:run_alphafold.py
+def predict_structure(
+    fold_input: folding_input.Input,
+    model_runner: ModelRunner,
+    buckets: Sequence[int] | None = None,
+    conformer_max_iterations: int | None = None,
+) -> Sequence[ResultsForSeed]:
+    """Runs the full inference pipeline with CPU-specific optimizations."""
+    
+    print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
+    ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
+    featurised_examples = featurisation.featurise_input(
+        fold_input=fold_input,
+        buckets=buckets,
+        ccd=ccd,
+        verbose=True,
+        conformer_max_iterations=conformer_max_iterations,
+    )
+    
+    def safe_process(x):
+        """安全地处理不同类型的数据"""
+        if isinstance(x, (np.ndarray, jnp.ndarray)):
+            if np.issubdtype(x.dtype, np.number):
+                return np.clip(x, -1e2, 1e2)
+        return x
+    
+    all_inference_results = []
+    for seed, example in zip(fold_input.rng_seeds, featurised_examples):
+        max_retries = 3
+        best_result = None
+        best_score = float('-inf')
+        
+        for attempt in range(max_retries):
+            try:
+                print(f'Running model inference with seed {seed} (attempt {attempt+1}/{max_retries})...')
+                
+                # 使用固定的随机种子
+                rng_key = jax.random.PRNGKey(seed)
+                
+                # 安全的输入预处理
+                try:
+                    example = jax.tree.map(safe_process, example)
+                except AttributeError:
+                    example = jax.tree_util.tree_map(safe_process, example)
+                
+                # 运行推理
+                result = model_runner.run_inference(example, rng_key)
+                
+                # 检查结果
+                def is_valid_array(x):
+                    if isinstance(x, (np.ndarray, jnp.ndarray)):
+                        if np.issubdtype(x.dtype, np.number):
+                            return not (np.any(np.isnan(x)) or np.any(np.abs(x) > 1e5))
+                    return True
+                
+                if not all(is_valid_array(v) for v in jax.tree_
 
 ---
 

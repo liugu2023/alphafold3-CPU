@@ -424,9 +424,16 @@ def predict_structure(
         conformer_max_iterations=conformer_max_iterations,
     )
     
+    def safe_process(x):
+        """安全地处理不同类型的数据"""
+        if isinstance(x, (np.ndarray, jnp.ndarray)):
+            if np.issubdtype(x.dtype, np.number):
+                return np.clip(x, -1e2, 1e2)
+        return x
+    
     all_inference_results = []
     for seed, example in zip(fold_input.rng_seeds, featurised_examples):
-        max_retries = 3  # 减少重试次数，因为我们使用了更保守的配置
+        max_retries = 3
         best_result = None
         best_score = float('-inf')
         
@@ -434,31 +441,24 @@ def predict_structure(
             try:
                 print(f'Running model inference with seed {seed} (attempt {attempt+1}/{max_retries})...')
                 
-                # 使用固定的随机种子以增加稳定性
+                # 使用固定的随机种子
                 rng_key = jax.random.PRNGKey(seed)
                 
-                # 简单的输入预处理
+                # 安全的输入预处理
                 try:
-                    example = jax.tree.map(
-                        lambda x: np.clip(x, -1e2, 1e2),  # 使用clip而不是nan_to_num
-                        example
-                    )
+                    example = jax.tree.map(safe_process, example)
                 except AttributeError:
-                    example = jax.tree_util.tree_map(
-                        lambda x: np.clip(x, -1e2, 1e2),
-                        example
-                    )
+                    example = jax.tree_util.tree_map(safe_process, example)
                 
                 # 运行推理
                 result = model_runner.run_inference(example, rng_key)
                 
-                # 简化的无效值检查
+                # 检查结果
                 def is_valid_array(x):
-                    if not isinstance(x, (np.ndarray, jnp.ndarray)):
-                        return True
-                    if not np.issubdtype(x.dtype, np.number):
-                        return True
-                    return not (np.any(np.isnan(x)) or np.any(np.abs(x) > 1e5))
+                    if isinstance(x, (np.ndarray, jnp.ndarray)):
+                        if np.issubdtype(x.dtype, np.number):
+                            return not (np.any(np.isnan(x)) or np.any(np.abs(x) > 1e5))
+                    return True
                 
                 if not all(is_valid_array(v) for v in jax.tree_util.tree_leaves(result)):
                     raise ValueError("Found invalid values in model output")
@@ -470,10 +470,8 @@ def predict_structure(
                 
                 # 计算结构质量分数
                 current_score = float(result.get('confidence_score', 0.0))
-                
                 print(f"Attempt {attempt+1} score: {current_score:.4f}")
                 
-                # 保存最好的结果
                 if current_score > best_score:
                     best_score = current_score
                     best_result = ResultsForSeed(
@@ -483,7 +481,6 @@ def predict_structure(
                         embeddings=model_runner.extract_embeddings(result),
                     )
                 
-                # 如果分数足够好就提前退出
                 if current_score > 0.7:
                     break
                     
