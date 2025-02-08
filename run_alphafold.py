@@ -425,10 +425,15 @@ def predict_structure(
     )
     
     def safe_process(x):
-        """安全地处理不同类型的数据"""
+        """安全地处理不同类型的数据，保持索引类型"""
         if isinstance(x, (np.ndarray, jnp.ndarray)):
             if np.issubdtype(x.dtype, np.number):
-                return np.clip(x, -1e2, 1e2)
+                if np.issubdtype(x.dtype, np.integer):
+                    # 保持整数类型不变
+                    return x
+                else:
+                    # 对浮点数进行裁剪
+                    return np.clip(x, -1e2, 1e2)
         return x
     
     all_inference_results = []
@@ -444,7 +449,7 @@ def predict_structure(
                 # 使用固定的随机种子
                 rng_key = jax.random.PRNGKey(seed)
                 
-                # 安全的输入预处理
+                # 预处理输入数据，保持索引类型
                 try:
                     example = jax.tree.map(safe_process, example)
                 except AttributeError:
@@ -457,7 +462,12 @@ def predict_structure(
                 def is_valid_array(x):
                     if isinstance(x, (np.ndarray, jnp.ndarray)):
                         if np.issubdtype(x.dtype, np.number):
-                            return not (np.any(np.isnan(x)) or np.any(np.abs(x) > 1e5))
+                            if np.issubdtype(x.dtype, np.integer):
+                                # 整数类型只检查是否有NaN
+                                return not np.any(np.isnan(x))
+                            else:
+                                # 浮点数检查NaN和范围
+                                return not (np.any(np.isnan(x)) or np.any(np.abs(x) > 1e5))
                     return True
                 
                 if not all(is_valid_array(v) for v in jax.tree_util.tree_leaves(result)):
@@ -484,7 +494,7 @@ def predict_structure(
                 if current_score > 0.7:
                     break
                     
-            except ValueError as e:
+            except (ValueError, TypeError) as e:
                 if attempt < max_retries - 1:
                     print(f"Encountered error: {str(e)}, retrying... ({attempt+1}/{max_retries})")
                     time.sleep(1)

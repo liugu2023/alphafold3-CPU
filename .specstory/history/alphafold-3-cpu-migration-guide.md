@@ -2396,7 +2396,218 @@ def predict_structure(
                             return not (np.any(np.isnan(x)) or np.any(np.abs(x) > 1e5))
                     return True
                 
-                if not all(is_valid_array(v) for v in jax.tree_
+                if not all(is_valid_array(v) for v in jax.tree_util.tree_leaves(result)):
+                    raise ValueError("Found invalid values in model output")
+                
+                # 提取结构
+                inference_results = model_runner.extract_structures(
+                    batch=example, result=result, target_name=fold_input.name
+                )
+                
+                # 计算结构质量分数
+                current_score = float(result.get('confidence_score', 0.0))
+                print(f"Attempt {attempt+1} score: {current_score:.4f}")
+                
+                if current_score > best_score:
+                    best_score = current_score
+                    best_result = ResultsForSeed(
+                        seed=seed,
+                        inference_results=inference_results,
+                        full_fold_input=fold_input,
+                        embeddings=model_runner.extract_embeddings(result),
+                    )
+                
+                if current_score > 0.7:
+                    break
+                    
+            except ValueError as e:
+                if attempt < max_retries - 1:
+                    print(f"Encountered error: {str(e)}, retrying... ({attempt+1}/{max_retries})")
+                    time.sleep(1)
+                    continue
+                else:
+                    print(f"Failed after {max_retries} attempts with seed {seed}")
+                    raise
+        
+        if best_result is not None:
+            print(f"Best score for seed {seed}: {best_score:.4f}")
+            all_inference_results.append(best_result)
+        else:
+            print(f"Warning: No valid results for seed {seed}")
+    
+    return all_inference_results
+```
+
+主要修改：
+
+1. 添加了安全的数据处理函数：
+```python
+def safe_process(x):
+    if isinstance(x, (np.ndarray, jnp.ndarray)):
+        if np.issubdtype(x.dtype, np.number):
+            return np.clip(x, -1e2, 1e2)
+    return x
+```
+
+2. 只对数值类型的数组进行处理，其他类型保持不变
+
+3. 改进了类型检查逻辑
+
+这样应该能避免类型错误，同时保持数值稳定性。
+
+---
+
+_**User**_
+
+Running model inference with seed 1 (attempt 1/3)...
+Traceback (most recent call last):
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 794, in <module>
+    app.run(main)
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/absl/app.py", line 308, in run
+    _run_main(main, args)
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/absl/app.py", line 254, in _run_main
+    sys.exit(main(argv))
+             ^^^^^^^^^^
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 779, in main
+    process_fold_input(
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 669, in process_fold_input
+    all_inference_results = predict_structure(
+                            ^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 454, in predict_structure
+    result = model_runner.run_inference(example, rng_key)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 354, in run_inference
+    result = self._model(rng_key, featurised_example)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/haiku/_src/transform.py", line 183, in apply_fn
+    out, state = f.apply(params, None, *args, **kwargs)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/haiku/_src/transform.py", line 456, in apply_fn
+    out = f(*args, **kwargs)
+  ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold3-CPU/run_alphafold.py", line 337, in forward_fn
+    return model.Model(self._model_config)(batch)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/haiku/_src/module.py", line 464, in wrapped
+    out = f(*args, **kwargs)
+          ^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/contextlib.py", line 81, in inner
+    return func(*args, **kwds)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/haiku/_src/module.py", line 305, in run_interceptors
+    return bound_method(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/alphafold3/model/model.py", line 270, in __call__
+    target_feat = create_target_feat_embedding(
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/alphafold3/model/model.py", line 155, in create_target_feat_embedding
+    enc = atom_cross_attention.atom_cross_att_encoder(
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/alphafold3/model/network/atom_cross_attention.py", line 127, in atom_cross_att_encoder
+    queries_single_cond = atom_layout.convert(
+                          ^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/alphafold3/model/atom_layout/atom_layout.py", line 951, in convert
+    out_arr = arr_flattened[gather_info.gather_idxs, ...]
+              ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/jax/_src/numpy/array_methods.py", line 1036, in op
+    return getattr(self.aval, f"_{name}")(self, *args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/jax/_src/numpy/array_methods.py", line 647, in _getitem
+    return lax_numpy._rewriting_take(self, item)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/jax/_src/numpy/lax_numpy.py", line 10622, in _rewriting_take
+    return _gather(arr, treedef, static_idx, dynamic_idx, indices_are_sorted,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/jax/_src/numpy/lax_numpy.py", line 10631, in _gather
+    indexer = _index_to_gather(shape(arr), idx)  # shared with _scatter_update
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/alphafold-CPU/lib/python3.11/site-packages/jax/_src/numpy/lax_numpy.py", line 10908, in _index_to_gather
+    raise TypeError(msg.format(abstract_i.dtype.name, idx_pos, i))
+TypeError: Indexer must have integer or boolean type, got indexer with type float32 at position 0, indexer value Traced<ShapedArray(float32[192,32])>with<DynamicJaxprTrace(level=1/0)>
+--------------------
+For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
+
+---
+
+_**Assistant**_
+
+
+
+
+
+看起来问题出在索引操作上，我们需要确保索引是整数类型。让我们修改数据处理函数：
+
+```python:run_alphafold.py
+def predict_structure(
+    fold_input: folding_input.Input,
+    model_runner: ModelRunner,
+    buckets: Sequence[int] | None = None,
+    conformer_max_iterations: int | None = None,
+) -> Sequence[ResultsForSeed]:
+    """Runs the full inference pipeline with CPU-specific optimizations."""
+    
+    print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
+    ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
+    featurised_examples = featurisation.featurise_input(
+        fold_input=fold_input,
+        buckets=buckets,
+        ccd=ccd,
+        verbose=True,
+        conformer_max_iterations=conformer_max_iterations,
+    )
+    
+    def safe_process(x):
+        """安全地处理不同类型的数据，保持索引类型"""
+        if isinstance(x, (np.ndarray, jnp.ndarray)):
+            if np.issubdtype(x.dtype, np.number):
+                if np.issubdtype(x.dtype, np.integer):
+                    # 保持整数类型不变
+                    return x
+                else:
+                    # 对浮点数进行裁剪
+                    return np.clip(x, -1e2, 1e2)
+        return x
+    
+    all_inference_results = []
+    for seed, example in zip(fold_input.rng_seeds, featurised_examples):
+        max_retries = 3
+        best_result = None
+        best_score = float('-inf')
+        
+        for attempt in range(max_retries):
+            try:
+                print(f'Running model inference with seed {seed} (attempt {attempt+1}/{max_retries})...')
+                
+                # 使用固定的随机种子
+                rng_key = jax.random.PRNGKey(seed)
+                
+                # 预处理输入数据，保持索引类型
+                try:
+                    example = jax.tree.map(safe_process, example)
+                except AttributeError:
+                    example = jax.tree_util.tree_map(safe_process, example)
+                
+                # 运行推理
+                result = model_runner.run_inference(example, rng_key)
+                
+                # 检查结果
+                def is_valid_array(x):
+                    if isinstance(x, (np.ndarray, jnp.ndarray)):
+                        if np.issubdtype(x.dtype, np.number):
+                            if np.issubdtype(x.dtype, np.integer):
+                                # 整数类型只检查是否有NaN
+                                return not np.any(np.isnan(x))
+                            else:
+                                # 浮点数检查NaN和范围
+                                return not (np.any(np.isnan(x)) or np.any(np.abs(x) > 1e5))
+                    return True
+                
+                if not all(is_valid_array(v) for v in jax.tree_util.tree_leaves(result)):
+                    raise ValueError("Found invalid values in model output")
+                
+                # 提取结构
+                inference_results = model_runner.extract_structures(
+                    batch=example, result=result, target
 
 ---
 
