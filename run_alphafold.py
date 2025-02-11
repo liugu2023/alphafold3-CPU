@@ -215,11 +215,8 @@ _JAX_COMPILATION_CACHE_DIR = flags.DEFINE_string(
     None,
     'Path to a directory for the JAX compilation cache.',
 )
-_GPU_DEVICE = flags.DEFINE_integer(
-    'gpu_device',
-    None,  # 改为None默认值
-    'Deprecated: GPU device selection is not supported in CPU-only mode.',
-)
+
+# 移除GPU相关的flags
 _BUCKETS = flags.DEFINE_list(
     'buckets',
     # pyformat: disable
@@ -230,25 +227,25 @@ _BUCKETS = flags.DEFINE_list(
     ' For any input with more tokens than the largest bucket size, a new bucket'
     ' is created for exactly that number of tokens.',
 )
+
+# 修改flash attention实现为仅支持XLA
 _FLASH_ATTENTION_IMPLEMENTATION = flags.DEFINE_enum(
     'flash_attention_implementation',
-    default='triton',
-    enum_values=['triton', 'cudnn', 'xla'],
+    default='xla',  # 默认改为xla
+    enum_values=['xla'],  # 只保留xla选项
     help=(
-        "Flash attention implementation to use. 'triton' and 'cudnn' uses a"
-        ' Triton and cuDNN flash attention implementation, respectively. The'
-        ' Triton kernel is fastest and has been tested more thoroughly. The'
-        " Triton and cuDNN kernels require Ampere GPUs or later. 'xla' uses an"
-        ' XLA attention implementation (no flash attention) and is portable'
-        ' across GPU devices.'
+        'Flash attention implementation to use. Only XLA implementation is'
+        ' supported in CPU-only mode.'
     ),
 )
+
 _NUM_RECYCLES = flags.DEFINE_integer(
     'num_recycles',
     10,
     'Number of recycles to use during inference.',
     lower_bound=1,
 )
+
 _NUM_DIFFUSION_SAMPLES = flags.DEFINE_integer(
     'num_diffusion_samples',
     5,
