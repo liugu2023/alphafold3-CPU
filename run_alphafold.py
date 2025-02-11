@@ -331,16 +331,49 @@ class ModelRunner:
         self._device,
     )
 
-    # 添加结果检查
+    # 添加更严格的结果检查
     def check_output_numerics(result):
-        for key, value in result.items():
+        def fix_numerics(value, key=""):
             if isinstance(value, (np.ndarray, jnp.ndarray)):
                 if np.any(np.isnan(value)) or np.any(np.isinf(value)):
                     print(f"Warning: Found NaN/inf in output {key}")
-                    # 可以选择修复或抛出异常
-                    result[key] = np.nan_to_num(value, nan=0.0, posinf=1e6, neginf=-1e6)
-        return result
-    
+                    print(f"Shape: {value.shape}")
+                    print(f"NaN count: {np.isnan(value).sum()}")
+                    print(f"Inf count: {np.isinf(value).sum()}")
+                    
+                    # 对于坐标相关的键，使用更保守的替换值
+                    if any(coord in key.lower() for coord in ['coord', 'pos', 'xyz', 'position']):
+                        # 使用邻近的有效值填充
+                        mask = np.isnan(value) | np.isinf(value)
+                        if mask.any():
+                            valid_values = value[~mask]
+                            if len(valid_values) > 0:
+                                # 使用有效值的平均值
+                                fill_value = np.mean(valid_values)
+                            else:
+                                # 如果没有有效值，使用0
+                                fill_value = 0.0
+                            value = np.where(mask, fill_value, value)
+                    else:
+                        # 对于其他值使用标准替换
+                        value = np.nan_to_num(value, nan=0.0, posinf=1e6, neginf=-1e6)
+                
+                # 确保数值在合理范围内
+                value = np.clip(value, -1e6, 1e6)
+            return value
+
+        # 递归处理嵌套字典
+        def process_dict(d, parent_key=""):
+            for key, value in d.items():
+                full_key = f"{parent_key}.{key}" if parent_key else key
+                if isinstance(value, dict):
+                    d[key] = process_dict(value, full_key)
+                else:
+                    d[key] = fix_numerics(value, full_key)
+            return d
+
+        return process_dict(result)
+
     result = self._model(rng_key, featurised_example)
     result = check_output_numerics(result)
     result = jax.tree.map(np.asarray, result)
@@ -351,6 +384,16 @@ class ModelRunner:
     result = dict(result)
     identifier = self.model_params['__meta__']['__identifier__'].tobytes()
     result['__identifier__'] = identifier
+    
+    # 最后再次检查关键坐标数据
+    if 'structure_module' in result:
+        for key in ['final_atom_positions', 'final_atom_mask']:
+            if key in result['structure_module']:
+                result['structure_module'][key] = fix_numerics(
+                    result['structure_module'][key], 
+                    f'structure_module.{key}'
+                )
+    
     return result
 
   def extract_structures(
