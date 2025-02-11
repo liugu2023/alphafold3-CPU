@@ -320,6 +320,50 @@ class ModelRunner:
         jax.jit(forward_fn.apply, device=self._device), self.model_params
     )
 
+  @staticmethod
+  def fix_numerics(value, key=""):
+    """修复数值问题的通用方法"""
+    if isinstance(value, (np.ndarray, jnp.ndarray)):
+      if np.any(np.isnan(value)) or np.any(np.isinf(value)):
+        print(f"Warning: Found NaN/inf in output {key}")
+        print(f"Shape: {value.shape}")
+        print(f"NaN count: {np.isnan(value).sum()}")
+        print(f"Inf count: {np.isinf(value).sum()}")
+        
+        # 对于坐标相关的键，使用更保守的替换值
+        if any(coord in key.lower() for coord in ['coord', 'pos', 'xyz', 'position']):
+          # 使用邻近的有效值填充
+          mask = np.isnan(value) | np.isinf(value)
+          if mask.any():
+            valid_values = value[~mask]
+            if len(valid_values) > 0:
+              # 使用有效值的平均值
+              fill_value = np.mean(valid_values)
+            else:
+              # 如果没有有效值，使用0
+              fill_value = 0.0
+            value = np.where(mask, fill_value, value)
+        else:
+          # 对于其他值使用标准替换
+          value = np.nan_to_num(value, nan=0.0, posinf=1e6, neginf=-1e6)
+      
+      # 确保数值在合理范围内
+      value = np.clip(value, -1e6, 1e6)
+    return value
+
+  def check_output_numerics(self, result):
+    """检查并修复输出中的数值问题"""
+    def process_dict(d, parent_key=""):
+      for key, value in d.items():
+        full_key = f"{parent_key}.{key}" if parent_key else key
+        if isinstance(value, dict):
+          d[key] = process_dict(value, full_key)
+        else:
+          d[key] = self.fix_numerics(value, full_key)
+      return d
+
+    return process_dict(result)
+
   def run_inference(
       self, featurised_example: features.BatchDict, rng_key: jnp.ndarray
   ) -> model.ModelResult:
@@ -331,51 +375,8 @@ class ModelRunner:
         self._device,
     )
 
-    # 添加更严格的结果检查
-    def check_output_numerics(result):
-        def fix_numerics(value, key=""):
-            if isinstance(value, (np.ndarray, jnp.ndarray)):
-                if np.any(np.isnan(value)) or np.any(np.isinf(value)):
-                    print(f"Warning: Found NaN/inf in output {key}")
-                    print(f"Shape: {value.shape}")
-                    print(f"NaN count: {np.isnan(value).sum()}")
-                    print(f"Inf count: {np.isinf(value).sum()}")
-                    
-                    # 对于坐标相关的键，使用更保守的替换值
-                    if any(coord in key.lower() for coord in ['coord', 'pos', 'xyz', 'position']):
-                        # 使用邻近的有效值填充
-                        mask = np.isnan(value) | np.isinf(value)
-                        if mask.any():
-                            valid_values = value[~mask]
-                            if len(valid_values) > 0:
-                                # 使用有效值的平均值
-                                fill_value = np.mean(valid_values)
-                            else:
-                                # 如果没有有效值，使用0
-                                fill_value = 0.0
-                            value = np.where(mask, fill_value, value)
-                    else:
-                        # 对于其他值使用标准替换
-                        value = np.nan_to_num(value, nan=0.0, posinf=1e6, neginf=-1e6)
-                
-                # 确保数值在合理范围内
-                value = np.clip(value, -1e6, 1e6)
-            return value
-
-        # 递归处理嵌套字典
-        def process_dict(d, parent_key=""):
-            for key, value in d.items():
-                full_key = f"{parent_key}.{key}" if parent_key else key
-                if isinstance(value, dict):
-                    d[key] = process_dict(value, full_key)
-                else:
-                    d[key] = fix_numerics(value, full_key)
-            return d
-
-        return process_dict(result)
-
     result = self._model(rng_key, featurised_example)
-    result = check_output_numerics(result)
+    result = self.check_output_numerics(result)
     result = jax.tree.map(np.asarray, result)
     result = jax.tree.map(
         lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x,
@@ -389,7 +390,7 @@ class ModelRunner:
     if 'structure_module' in result:
         for key in ['final_atom_positions', 'final_atom_mask']:
             if key in result['structure_module']:
-                result['structure_module'][key] = fix_numerics(
+                result['structure_module'][key] = self.fix_numerics(
                     result['structure_module'][key], 
                     f'structure_module.{key}'
                 )
