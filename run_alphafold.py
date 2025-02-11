@@ -48,13 +48,16 @@ from alphafold3.model import model
 from alphafold3.model import params
 from alphafold3.model import post_processing
 from alphafold3.model.components import utils
-import haiku as hk
+
+# 在导入jax之前设置CPU后端
+import os
+os.environ['JAX_PLATFORM_NAME'] = 'cpu'  # 使用环境变量设置
 import jax
+jax.config.update('jax_platform_name', 'cpu')  # 双重保证使用config设置
+
+import haiku as hk
 from jax import numpy as jnp
 import numpy as np
-# 强制使用CPU后端
-jax.config.update('jax_platform_name', 'cpu')
-
 
 _HOME_DIR = pathlib.Path(os.environ.get('HOME'))
 _DEFAULT_MODEL_DIR = _HOME_DIR / 'models'
