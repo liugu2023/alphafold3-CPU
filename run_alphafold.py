@@ -213,7 +213,7 @@ _JAX_COMPILATION_CACHE_DIR = flags.DEFINE_string(
 _GPU_DEVICE = flags.DEFINE_integer(
     'gpu_device',
     None,  # 改为None默认值
-    'Deprecated. AlphaFold 3 now runs on CPU only.',
+    'Deprecated: GPU device selection is not supported in CPU-only mode.',
 )
 _BUCKETS = flags.DEFINE_list(
     'buckets',
@@ -272,32 +272,20 @@ _SAVE_EMBEDDINGS = flags.DEFINE_bool(
 
 def make_model_config(
     *,
-    flash_attention_implementation: attention.Implementation = 'xla',
+    flash_attention_implementation: attention.Implementation = 'triton',
     num_diffusion_samples: int = 5,
     num_recycles: int = 10,
     return_embeddings: bool = False,
 ) -> model.Model.Config:
-    """Returns a model config optimized for CPU inference."""
-    config = model.Model.Config()
-    
-    # 基本配置
-    config.global_config.flash_attention_implementation = flash_attention_implementation
-    config.heads.diffusion.eval.num_samples = num_diffusion_samples
-    config.num_recycles = num_recycles
-    config.return_embeddings = return_embeddings
-    
-    # CPU特定优化
-    config.global_config.deterministic = True
-    config.global_config.jax_enable_x64 = True
-    config.global_config.epsilon = 1e-7
-    
-    # 使用GPU版本的扩散参数
-    config.heads.diffusion.eval.temperature = 0.1
-    config.heads.diffusion.eval.min_beta = 1e-4
-    config.heads.diffusion.eval.max_beta = 0.02
-    config.heads.diffusion.eval.num_steps = 200
-    
-    return config
+  """Returns a model config with some defaults overridden."""
+  config = model.Model.Config()
+  config.global_config.flash_attention_implementation = (
+      flash_attention_implementation
+  )
+  config.heads.diffusion.eval.num_samples = num_diffusion_samples
+  config.num_recycles = num_recycles
+  config.return_embeddings = return_embeddings
+  return config
 
 
 class ModelRunner:
@@ -404,96 +392,63 @@ def predict_structure(
     buckets: Sequence[int] | None = None,
     conformer_max_iterations: int | None = None,
 ) -> Sequence[ResultsForSeed]:
-    """Runs inference with minimal data preprocessing."""
-    
-    print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
-    ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
-    featurised_examples = featurisation.featurise_input(
-        fold_input=fold_input,
-        buckets=buckets,
-        ccd=ccd,
-        verbose=True,
-        conformer_max_iterations=conformer_max_iterations,
+  """Runs the full inference pipeline to predict structures for each seed."""
+
+  print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
+  featurisation_start_time = time.time()
+  ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
+  featurised_examples = featurisation.featurise_input(
+      fold_input=fold_input,
+      buckets=buckets,
+      ccd=ccd,
+      verbose=True,
+      conformer_max_iterations=conformer_max_iterations,
+  )
+  print(
+      f'Featurising data with {len(fold_input.rng_seeds)} seed(s) took'
+      f' {time.time() - featurisation_start_time:.2f} seconds.'
+  )
+  print(
+      'Running model inference and extracting output structure samples with'
+      f' {len(fold_input.rng_seeds)} seed(s)...'
+  )
+  all_inference_start_time = time.time()
+  all_inference_results = []
+  for seed, example in zip(fold_input.rng_seeds, featurised_examples):
+    print(f'Running model inference with seed {seed}...')
+    inference_start_time = time.time()
+    rng_key = jax.random.PRNGKey(seed)
+    result = model_runner.run_inference(example, rng_key)
+    print(
+        f'Running model inference with seed {seed} took'
+        f' {time.time() - inference_start_time:.2f} seconds.'
     )
-    
-    all_inference_results = []
-    for seed, example in zip(fold_input.rng_seeds, featurised_examples):
-        max_retries = 3
-        best_result = None
-        best_score = float('-inf')
-        
-        for attempt in range(max_retries):
-            try:
-                print(f'Running model inference with seed {seed} (attempt {attempt+1}/{max_retries})...')
-                
-                # 使用固定的随机种子
-                rng_key = jax.random.PRNGKey(seed)
-                
-                # 最小化数据预处理
-                def minimal_process(x):
-                    """最小化的数据预处理"""
-                    if isinstance(x, (np.ndarray, jnp.ndarray)):
-                        if np.issubdtype(x.dtype, np.floating):
-                            return np.nan_to_num(x, nan=0.0)
-                    return x
-                
-                try:
-                    example = jax.tree.map(minimal_process, example)
-                except AttributeError:
-                    example = jax.tree_util.tree_map(minimal_process, example)
-                
-                # 运行推理
-                result = model_runner.run_inference(example, rng_key)
-                
-                # 简化的结果验证
-                def check_result(x):
-                    """只检查关键数值的有效性"""
-                    if isinstance(x, (np.ndarray, jnp.ndarray)):
-                        if np.issubdtype(x.dtype, np.floating):
-                            if x.size > 0:  # 只检查非空数组
-                                return not np.any(np.isnan(x))
-                    return True
-                
-                if not all(check_result(v) for v in jax.tree_util.tree_leaves(result)):
-                    raise ValueError("Found NaN values in critical outputs")
-                
-                # 提取结构
-                inference_results = model_runner.extract_structures(
-                    batch=example, result=result, target_name=fold_input.name
-                )
-                
-                # 计算分数
-                current_score = float(result.get('confidence_score', 0.0))
-                print(f"Attempt {attempt+1} score: {current_score:.4f}")
-                
-                if current_score > best_score:
-                    best_score = current_score
-                    best_result = ResultsForSeed(
-                        seed=seed,
-                        inference_results=inference_results,
-                        full_fold_input=fold_input,
-                        embeddings=model_runner.extract_embeddings(result),
-                    )
-                
-                if current_score > 0.7:
-                    break
-                    
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    print(f"Error: {str(e)}, retrying... ({attempt+1}/{max_retries})")
-                    time.sleep(1)
-                    continue
-                else:
-                    print(f"Failed after {max_retries} attempts with seed {seed}")
-                    raise
-        
-        if best_result is not None:
-            print(f"Best score for seed {seed}: {best_score:.4f}")
-            all_inference_results.append(best_result)
-        else:
-            print(f"Warning: No valid results for seed {seed}")
-    
-    return all_inference_results
+    print(f'Extracting output structure samples with seed {seed}...')
+    extract_structures = time.time()
+    inference_results = model_runner.extract_structures(
+        batch=example, result=result, target_name=fold_input.name
+    )
+    print(
+        f'Extracting {len(inference_results)} output structure samples with'
+        f' seed {seed} took {time.time() - extract_structures:.2f} seconds.'
+    )
+
+    embeddings = model_runner.extract_embeddings(result)
+
+    all_inference_results.append(
+        ResultsForSeed(
+            seed=seed,
+            inference_results=inference_results,
+            full_fold_input=fold_input,
+            embeddings=embeddings,
+        )
+    )
+  print(
+      'Running model inference and extracting output structures with'
+      f' {len(fold_input.rng_seeds)} seed(s) took'
+      f' {time.time() - all_inference_start_time:.2f} seconds.'
+  )
+  return all_inference_results
 
 
 def write_fold_input_json(
@@ -715,43 +670,55 @@ def main(_):
     print(f'Failed to create output directory {_OUTPUT_DIR.value}: {e}')
     raise
 
+  notice = textwrap.wrap(
+      'Running AlphaFold 3. Please note that standard AlphaFold 3 model'
+      ' parameters are only available under terms of use provided at'
+      ' https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md.'
+      ' If you do not agree to these terms and are using AlphaFold 3 derived'
+      ' model parameters, cancel execution of AlphaFold 3 inference with'
+      ' CTRL-C, and do not use the model parameters.',
+      break_long_words=False,
+      break_on_hyphens=False,
+      width=80,
+  )
+  print('\n' + '\n'.join(notice) + '\n')
+
+  if _RUN_DATA_PIPELINE.value:
+    expand_path = lambda x: replace_db_dir(x, DB_DIR.value)
+    max_template_date = datetime.date.fromisoformat(_MAX_TEMPLATE_DATE.value)
+    data_pipeline_config = pipeline.DataPipelineConfig(
+        jackhmmer_binary_path=_JACKHMMER_BINARY_PATH.value,
+        nhmmer_binary_path=_NHMMER_BINARY_PATH.value,
+        hmmalign_binary_path=_HMMALIGN_BINARY_PATH.value,
+        hmmsearch_binary_path=_HMMSEARCH_BINARY_PATH.value,
+        hmmbuild_binary_path=_HMMBUILD_BINARY_PATH.value,
+        small_bfd_database_path=expand_path(_SMALL_BFD_DATABASE_PATH.value),
+        mgnify_database_path=expand_path(_MGNIFY_DATABASE_PATH.value),
+        uniprot_cluster_annot_database_path=expand_path(
+            _UNIPROT_CLUSTER_ANNOT_DATABASE_PATH.value
+        ),
+        uniref90_database_path=expand_path(_UNIREF90_DATABASE_PATH.value),
+        ntrna_database_path=expand_path(_NTRNA_DATABASE_PATH.value),
+        rfam_database_path=expand_path(_RFAM_DATABASE_PATH.value),
+        rna_central_database_path=expand_path(_RNA_CENTRAL_DATABASE_PATH.value),
+        pdb_database_path=expand_path(_PDB_DATABASE_PATH.value),
+        seqres_database_path=expand_path(_SEQRES_DATABASE_PATH.value),
+        jackhmmer_n_cpu=_JACKHMMER_N_CPU.value,
+        nhmmer_n_cpu=_NHMMER_N_CPU.value,
+        max_template_date=max_template_date,
+    )
+  else:
+    data_pipeline_config = None
+
   if _RUN_INFERENCE.value:
     # 使用CPU设备
     devices = jax.local_devices(backend='cpu')
     print(f'Using CPU device: {devices[0]}')
 
-    # 添加data_pipeline_config的定义
-    if _RUN_DATA_PIPELINE.value:
-      expand_path = lambda x: replace_db_dir(x, DB_DIR.value)
-      max_template_date = datetime.date.fromisoformat(_MAX_TEMPLATE_DATE.value)
-      data_pipeline_config = pipeline.DataPipelineConfig(
-          jackhmmer_binary_path=_JACKHMMER_BINARY_PATH.value,
-          nhmmer_binary_path=_NHMMER_BINARY_PATH.value,
-          hmmalign_binary_path=_HMMALIGN_BINARY_PATH.value,
-          hmmsearch_binary_path=_HMMSEARCH_BINARY_PATH.value,
-          hmmbuild_binary_path=_HMMBUILD_BINARY_PATH.value,
-          small_bfd_database_path=expand_path(_SMALL_BFD_DATABASE_PATH.value),
-          mgnify_database_path=expand_path(_MGNIFY_DATABASE_PATH.value),
-          uniprot_cluster_annot_database_path=expand_path(
-              _UNIPROT_CLUSTER_ANNOT_DATABASE_PATH.value
-          ),
-          uniref90_database_path=expand_path(_UNIREF90_DATABASE_PATH.value),
-          ntrna_database_path=expand_path(_NTRNA_DATABASE_PATH.value),
-          rfam_database_path=expand_path(_RFAM_DATABASE_PATH.value),
-          rna_central_database_path=expand_path(_RNA_CENTRAL_DATABASE_PATH.value),
-          pdb_database_path=expand_path(_PDB_DATABASE_PATH.value),
-          seqres_database_path=expand_path(_SEQRES_DATABASE_PATH.value),
-          jackhmmer_n_cpu=_JACKHMMER_N_CPU.value,
-          nhmmer_n_cpu=_NHMMER_N_CPU.value,
-          max_template_date=max_template_date,
-      )
-    else:
-      data_pipeline_config = None
-
     print('Building model from scratch...')
     model_runner = ModelRunner(
         config=make_model_config(
-            flash_attention_implementation='xla',  # 在CPU上使用XLA实现
+            flash_attention_implementation='xla',  # CPU只支持XLA实现
             num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
             num_recycles=_NUM_RECYCLES.value,
             return_embeddings=_SAVE_EMBEDDINGS.value,
@@ -759,7 +726,7 @@ def main(_):
         device=devices[0],  # 使用第一个CPU设备
         model_dir=pathlib.Path(MODEL_DIR.value),
     )
-    # 检查模型参数是否可以加载
+    # 检查模型参数加载
     print('Checking that model parameters can be loaded...')
     _ = model_runner.model_params
   else:
