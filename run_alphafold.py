@@ -48,16 +48,11 @@ from alphafold3.model import model
 from alphafold3.model import params
 from alphafold3.model import post_processing
 from alphafold3.model.components import utils
-
-# 在导入jax之前设置CPU后端
-import os
-os.environ['JAX_PLATFORM_NAME'] = 'cpu'  # 使用环境变量设置
-import jax
-jax.config.update('jax_platform_name', 'cpu')  # 双重保证使用config设置
-
 import haiku as hk
+import jax
 from jax import numpy as jnp
 import numpy as np
+
 
 _HOME_DIR = pathlib.Path(os.environ.get('HOME'))
 _DEFAULT_MODEL_DIR = _HOME_DIR / 'models'
@@ -215,8 +210,11 @@ _JAX_COMPILATION_CACHE_DIR = flags.DEFINE_string(
     None,
     'Path to a directory for the JAX compilation cache.',
 )
-
-# 移除GPU相关的flags
+_GPU_DEVICE = flags.DEFINE_integer(
+    'gpu_device',
+    None,  # 改为None默认值
+    'Deprecated: GPU device selection is not supported in CPU-only mode.',
+)
 _BUCKETS = flags.DEFINE_list(
     'buckets',
     # pyformat: disable
@@ -227,25 +225,25 @@ _BUCKETS = flags.DEFINE_list(
     ' For any input with more tokens than the largest bucket size, a new bucket'
     ' is created for exactly that number of tokens.',
 )
-
-# 修改flash attention实现为仅支持XLA
 _FLASH_ATTENTION_IMPLEMENTATION = flags.DEFINE_enum(
     'flash_attention_implementation',
-    default='xla',  # 默认改为xla
-    enum_values=['xla'],  # 只保留xla选项
+    default='triton',
+    enum_values=['triton', 'cudnn', 'xla'],
     help=(
-        'Flash attention implementation to use. Only XLA implementation is'
-        ' supported in CPU-only mode.'
+        "Flash attention implementation to use. 'triton' and 'cudnn' uses a"
+        ' Triton and cuDNN flash attention implementation, respectively. The'
+        ' Triton kernel is fastest and has been tested more thoroughly. The'
+        " Triton and cuDNN kernels require Ampere GPUs or later. 'xla' uses an"
+        ' XLA attention implementation (no flash attention) and is portable'
+        ' across GPU devices.'
     ),
 )
-
 _NUM_RECYCLES = flags.DEFINE_integer(
     'num_recycles',
     10,
     'Number of recycles to use during inference.',
     lower_bound=1,
 )
-
 _NUM_DIFFUSION_SAMPLES = flags.DEFINE_integer(
     'num_diffusion_samples',
     5,
