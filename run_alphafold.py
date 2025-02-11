@@ -52,6 +52,8 @@ import haiku as hk
 import jax
 from jax import numpy as jnp
 import numpy as np
+# 强制使用CPU后端
+jax.config.update('jax_platform_name', 'cpu')
 
 
 _HOME_DIR = pathlib.Path(os.environ.get('HOME'))
