@@ -331,7 +331,18 @@ class ModelRunner:
         self._device,
     )
 
+    # 添加结果检查
+    def check_output_numerics(result):
+        for key, value in result.items():
+            if isinstance(value, (np.ndarray, jnp.ndarray)):
+                if np.any(np.isnan(value)) or np.any(np.isinf(value)):
+                    print(f"Warning: Found NaN/inf in output {key}")
+                    # 可以选择修复或抛出异常
+                    result[key] = np.nan_to_num(value, nan=0.0, posinf=1e6, neginf=-1e6)
+        return result
+    
     result = self._model(rng_key, featurised_example)
+    result = check_output_numerics(result)
     result = jax.tree.map(np.asarray, result)
     result = jax.tree.map(
         lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x,
