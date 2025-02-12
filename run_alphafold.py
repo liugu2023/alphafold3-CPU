@@ -39,6 +39,7 @@ import gc
 from contextlib import contextmanager
 import hashlib
 import json
+import queue
 
 from absl import app
 from absl import flags
@@ -695,6 +696,45 @@ def predict_structure_for_seed(
     )
 
 
+def worker_process(
+    task_queue: multiprocessing.Queue,
+    result_queue: multiprocessing.Queue,
+    model_config: model.Model.Config,
+    model_dir: pathlib.Path,
+):
+    """工作进程处理函数"""
+    try:
+        while True:
+            try:
+                # 非阻塞方式获取任务
+                task = task_queue.get_nowait()
+            except queue.Empty:
+                # 没有任务时退出
+                break
+            
+            seed, featurised_example, fold_input = task
+            
+            try:
+                with memory_tracker(f"Worker Process {os.getpid()}"):
+                    result = predict_structure_for_seed(
+                        seed=seed,
+                        featurised_example=featurised_example,
+                        model_config=model_config,
+                        model_dir=model_dir,
+                        fold_input=fold_input,
+                    )
+                    result_queue.put((seed, result))
+            except Exception as e:
+                print(f"Error in worker {os.getpid()} processing seed {seed}: {e}")
+                result_queue.put((seed, e))
+            
+            # 主动清理内存
+            gc.collect()
+            
+    except Exception as e:
+        print(f"Worker process {os.getpid()} failed: {e}")
+        raise
+
 def predict_structure(
     fold_input: folding_input.Input,
     model_config: model.Model.Config,
@@ -702,7 +742,7 @@ def predict_structure(
     buckets: Sequence[int] | None = None,
     conformer_max_iterations: int | None = None,
 ) -> Sequence[ResultsForSeed]:
-    """并行运行推理管道来预测每个seed的结构，添加内存管理"""
+    """并行运行推理管道来预测每个seed的结构，添加动态负载均衡"""
     
     with memory_tracker("Data Featurisation"):
         print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
@@ -720,7 +760,7 @@ def predict_structure(
             f' {time.time() - featurisation_start_time:.2f} seconds.'
         )
     
-    # 根据可用内存动态调整并行度
+    # 根据系统资源动态调整进程数
     available_memory = psutil.virtual_memory().available
     memory_per_process = 2 * 1024 * 1024 * 1024  # 估计每个进程2GB内存
     max_processes_by_memory = max(1, available_memory // memory_per_process)
@@ -739,38 +779,91 @@ def predict_structure(
     print(f'Available memory: {available_memory / 1024 / 1024:.2f} MB')
     print(f'Estimated memory per process: {memory_per_process / 1024 / 1024:.2f} MB')
     
-    all_inference_start_time = time.time()
+    # 创建任务队列和结果队列
+    task_queue = multiprocessing.Queue()
+    result_queue = multiprocessing.Queue()
     
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        futures = [
-            executor.submit(
-                predict_structure_for_seed,
-                seed,
-                example,
-                model_config,
-                model_dir,
-                fold_input,
-            )
-            for seed, example in zip(fold_input.rng_seeds, featurised_examples)
-        ]
-        
-        # 及时释放featurised_examples
-        del featurised_examples
-        gc.collect()
-        
-        all_inference_results = []
-        for future in futures:
+    # 将任务放入队列
+    for seed, example in zip(fold_input.rng_seeds, featurised_examples):
+        task_queue.put((seed, example, fold_input))
+    
+    # 创建并启动工作进程
+    processes = []
+    for _ in range(num_workers):
+        p = multiprocessing.Process(
+            target=worker_process,
+            args=(task_queue, result_queue, model_config, model_dir)
+        )
+        p.start()
+        processes.append(p)
+    
+    # 收集结果
+    all_inference_results = []
+    completed_seeds = set()
+    total_seeds = len(fold_input.rng_seeds)
+    
+    start_time = time.time()
+    last_progress_time = start_time
+    
+    try:
+        while len(completed_seeds) < total_seeds:
             try:
-                result = future.result()
+                seed, result = result_queue.get(timeout=300)  # 5分钟超时
+                
+                if isinstance(result, Exception):
+                    print(f"Error processing seed {seed}: {result}")
+                    continue
+                
                 all_inference_results.append(result)
-            except Exception as e:
-                print(f"Error in worker process: {e}")
-                raise
+                completed_seeds.add(seed)
+                
+                # 每30秒打印一次进度
+                current_time = time.time()
+                if current_time - last_progress_time > 30:
+                    elapsed = current_time - start_time
+                    completed = len(completed_seeds)
+                    remaining = total_seeds - completed
+                    rate = completed / elapsed if elapsed > 0 else 0
+                    eta = remaining / rate if rate > 0 else 0
+                    
+                    print(f"Progress: {completed}/{total_seeds} seeds completed")
+                    print(f"Rate: {rate:.2f} seeds/second")
+                    print(f"ETA: {eta/60:.1f} minutes")
+                    
+                    last_progress_time = current_time
+                
+            except queue.Empty:
+                print("Warning: No results received for 5 minutes")
+                
+    except KeyboardInterrupt:
+        print("\nInterrupted by user. Cleaning up...")
+        for p in processes:
+            p.terminate()
+    finally:
+        # 等待所有进程完成
+        for p in processes:
+            p.join()
+        
+        # 清理队列
+        while not task_queue.empty():
+            try:
+                task_queue.get_nowait()
+            except queue.Empty:
+                break
+        
+        while not result_queue.empty():
+            try:
+                result_queue.get_nowait()
+            except queue.Empty:
+                break
+    
+    # 按seed排序结果
+    all_inference_results.sort(key=lambda x: x.seed)
     
     print(
         'Running parallel model inference and extracting output structures with'
         f' {len(fold_input.rng_seeds)} seed(s) took'
-        f' {time.time() - all_inference_start_time:.2f} seconds.'
+        f' {time.time() - start_time:.2f} seconds.'
     )
     
     return all_inference_results
