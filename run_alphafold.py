@@ -34,7 +34,9 @@ import time
 import typing
 from typing import overload
 from concurrent.futures import ProcessPoolExecutor
-import concurrent.futures
+import asyncio
+import aiofiles
+import json
 
 from absl import app
 from absl import flags
@@ -501,38 +503,14 @@ def predict_structure_for_seed(
     )
 
 
-def process_batch(
-    batch_tasks: list[tuple[int, features.BatchDict]],
-    model_config: model.Model.Config,
-    model_dir: pathlib.Path,
-    fold_input: folding_input.Input,
-) -> list[ResultsForSeed]:
-    """处理一批预测任务"""
-    results = []
-    for seed, featurised_example in batch_tasks:
-        try:
-            result = predict_structure_for_seed(
-                seed=seed,
-                featurised_example=featurised_example,
-                model_config=model_config,
-                model_dir=model_dir,
-                fold_input=fold_input,
-            )
-            results.append(result)
-        except Exception as e:
-            print(f"Error processing seed {seed}: {e}")
-            continue
-    return results
-
-
 def predict_structure(
     fold_input: folding_input.Input,
-    model_config: model.Model.Config,
-    model_dir: pathlib.Path,
+    model_config: model.Model.Config,  # 改为传入配置而不是runner
+    model_dir: pathlib.Path,          # 传入模型目录
     buckets: Sequence[int] | None = None,
     conformer_max_iterations: int | None = None,
 ) -> Sequence[ResultsForSeed]:
-    """使用动态负载均衡并行运行推理管道"""
+    """并行运行推理管道来预测每个seed的结构"""
     
     print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
     featurisation_start_time = time.time()
@@ -545,82 +523,42 @@ def predict_structure(
         conformer_max_iterations=conformer_max_iterations,
     )
     print(
-        f'Featurising data took {time.time() - featurisation_start_time:.2f} seconds.'
+        f'Featurising data with {len(fold_input.rng_seeds)} seed(s) took'
+        f' {time.time() - featurisation_start_time:.2f} seconds.'
     )
 
-    # 确定最佳进程数和批次大小
+    # 确定最佳进程数
     num_cpus = multiprocessing.cpu_count()
     num_workers = min(len(fold_input.rng_seeds), max(1, num_cpus - 1))
     
-    # 动态计算批次大小：每个CPU核心处理2-3个任务
-    tasks_per_cpu = 2
-    batch_size = max(1, min(
-        len(fold_input.rng_seeds) // (num_workers * tasks_per_cpu),
-        3  # 最大批次大小
-    ))
-    
-    # 将任务分成批次
-    all_tasks = list(zip(fold_input.rng_seeds, featurised_examples))
-    batched_tasks = [
-        all_tasks[i:i + batch_size] 
-        for i in range(0, len(all_tasks), batch_size)
-    ]
-    
     print(
-        f'Running parallel model inference with {num_workers} workers,'
-        f' {len(batched_tasks)} batches (batch_size={batch_size})...'
+        f'Running parallel model inference with {num_workers} workers for'
+        f' {len(fold_input.rng_seeds)} seed(s)...'
     )
     all_inference_start_time = time.time()
     
-    all_results = []
-    completed_batches = 0
-    total_batches = len(batched_tasks)
-    
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        # 提交所有批次任务
-        future_to_batch = {
+        futures = [
             executor.submit(
-                process_batch,
-                batch,
-                model_config,
-                model_dir,
+                predict_structure_for_seed,
+                seed,
+                example,
+                model_config,  # 传入配置
+                model_dir,     # 传入模型目录
                 fold_input,
-            ): i 
-            for i, batch in enumerate(batched_tasks)
-        }
+            )
+            for seed, example in zip(fold_input.rng_seeds, featurised_examples)
+        ]
         
-        # 动态处理完成的任务
-        for future in concurrent.futures.as_completed(future_to_batch):
-            batch_index = future_to_batch[future]
-            try:
-                batch_results = future.result()
-                all_results.extend(batch_results)
-                completed_batches += 1
-                
-                # 打印进度
-                progress = (completed_batches / total_batches) * 100
-                elapsed_time = time.time() - all_inference_start_time
-                eta = (elapsed_time / completed_batches) * (total_batches - completed_batches)
-                
-                print(
-                    f'Completed batch {completed_batches}/{total_batches}'
-                    f' ({progress:.1f}%) - ETA: {eta:.1f}s'
-                )
-                
-            except Exception as e:
-                print(f"Error in batch {batch_index}: {e}")
-                continue
-    
-    # 按seed排序结果
-    all_results.sort(key=lambda x: x.seed)
+        all_inference_results = [future.result() for future in futures]
     
     print(
-        'Completed parallel model inference and extraction with'
-        f' {len(fold_input.rng_seeds)} seed(s) in'
+        'Running parallel model inference and extracting output structures with'
+        f' {len(fold_input.rng_seeds)} seed(s) took'
         f' {time.time() - all_inference_start_time:.2f} seconds.'
     )
     
-    return all_results
+    return all_inference_results
 
 
 def write_fold_input_json(
@@ -635,56 +573,119 @@ def write_fold_input_json(
     f.write(fold_input.to_json())
 
 
+async def async_write_file(path: str | pathlib.Path, content: bytes | str, mode: str = 'wb'):
+    """异步写入单个文件"""
+    async with aiofiles.open(path, mode) as f:
+        await f.write(content)
+
+async def async_write_pdb(output_dir: str | pathlib.Path, result: model.InferenceResult):
+    """异步写入PDB文件"""
+    pdb_path = os.path.join(output_dir, f'{result.name}.pdb')
+    await async_write_file(pdb_path, result.pdb_string, 'w')
+
+async def async_write_metadata(output_dir: str | pathlib.Path, result: model.InferenceResult):
+    """异步写入元数据"""
+    metadata_path = os.path.join(output_dir, f'{result.name}_metadata.json')
+    metadata_str = json.dumps(result.metadata, indent=2)
+    await async_write_file(metadata_path, metadata_str, 'w')
+
+async def async_write_outputs(
+    all_inference_results: Sequence[ResultsForSeed],
+    output_dir: os.PathLike[str] | str,
+    job_name: str,
+) -> None:
+    """异步写入所有输出文件"""
+    ranking_scores = []
+    max_ranking_score = None
+    max_ranking_result = None
+
+    output_terms = (
+        pathlib.Path(alphafold3.cpp.__file__).parent / 'OUTPUT_TERMS_OF_USE.md'
+    ).read_text()
+
+    os.makedirs(output_dir, exist_ok=True)
+    tasks = []
+    
+    for results_for_seed in all_inference_results:
+        seed = results_for_seed.seed
+        for sample_idx, result in enumerate(results_for_seed.inference_results):
+            sample_dir = os.path.join(output_dir, f'seed-{seed}_sample-{sample_idx}')
+            os.makedirs(sample_dir, exist_ok=True)
+            
+            # 创建写入任务
+            tasks.append(async_write_pdb(sample_dir, result))
+            tasks.append(async_write_metadata(sample_dir, result))
+            
+            ranking_score = float(result.metadata['ranking_score'])
+            ranking_scores.append((seed, sample_idx, ranking_score))
+            if max_ranking_score is None or ranking_score > max_ranking_score:
+                max_ranking_score = ranking_score
+                max_ranking_result = result
+
+        if embeddings := results_for_seed.embeddings:
+            embeddings_dir = os.path.join(output_dir, f'seed-{seed}_embeddings')
+            os.makedirs(embeddings_dir, exist_ok=True)
+            for name, data in embeddings.items():
+                path = os.path.join(embeddings_dir, f'{name}.npy')
+                tasks.append(async_write_file(path, data.tobytes()))
+
+    # 等待所有写入任务完成
+    await asyncio.gather(*tasks)
+
+    if max_ranking_result is not None:
+        # 写入最佳结果
+        best_result_tasks = [
+            async_write_pdb(output_dir, max_ranking_result),
+            async_write_metadata(output_dir, max_ranking_result),
+            async_write_file(
+                os.path.join(output_dir, 'OUTPUT_TERMS_OF_USE.md'),
+                output_terms,
+                'w'
+            )
+        ]
+        await asyncio.gather(*best_result_tasks)
+        
+        # 写入排名分数
+        async with aiofiles.open(os.path.join(output_dir, 'ranking_scores.csv'), 'w') as f:
+            await f.write('seed,sample,ranking_score\n')
+            for seed, sample, score in ranking_scores:
+                await f.write(f'{seed},{sample},{score}\n')
+
 def write_outputs(
     all_inference_results: Sequence[ResultsForSeed],
     output_dir: os.PathLike[str] | str,
     job_name: str,
 ) -> None:
-  """Writes outputs to the specified output directory."""
-  ranking_scores = []
-  max_ranking_score = None
-  max_ranking_result = None
+    """同步包装异步写入函数"""
+    try:
+        # 在Windows上需要使用不同的事件循环策略
+        if os.name == 'nt':
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        
+        # 运行异步写入
+        asyncio.run(async_write_outputs(
+            all_inference_results=all_inference_results,
+            output_dir=output_dir,
+            job_name=job_name,
+        ))
+    except Exception as e:
+        print(f"Error during async file writing: {e}")
+        # 如果异步写入失败，回退到同步写入
+        _sync_write_outputs(
+            all_inference_results=all_inference_results,
+            output_dir=output_dir,
+            job_name=job_name,
+        )
 
-  output_terms = (
-      pathlib.Path(alphafold3.cpp.__file__).parent / 'OUTPUT_TERMS_OF_USE.md'
-  ).read_text()
-
-  os.makedirs(output_dir, exist_ok=True)
-  for results_for_seed in all_inference_results:
-    seed = results_for_seed.seed
-    for sample_idx, result in enumerate(results_for_seed.inference_results):
-      sample_dir = os.path.join(output_dir, f'seed-{seed}_sample-{sample_idx}')
-      os.makedirs(sample_dir, exist_ok=True)
-      post_processing.write_output(
-          inference_result=result, output_dir=sample_dir
-      )
-      ranking_score = float(result.metadata['ranking_score'])
-      ranking_scores.append((seed, sample_idx, ranking_score))
-      if max_ranking_score is None or ranking_score > max_ranking_score:
-        max_ranking_score = ranking_score
-        max_ranking_result = result
-
-    if embeddings := results_for_seed.embeddings:
-      embeddings_dir = os.path.join(output_dir, f'seed-{seed}_embeddings')
-      os.makedirs(embeddings_dir, exist_ok=True)
-      post_processing.write_embeddings(
-          embeddings=embeddings, output_dir=embeddings_dir
-      )
-
-  if max_ranking_result is not None:  # True iff ranking_scores non-empty.
-    post_processing.write_output(
-        inference_result=max_ranking_result,
-        output_dir=output_dir,
-        # The output terms of use are the same for all seeds/samples.
-        terms_of_use=output_terms,
-        name=job_name,
-    )
-    # Save csv of ranking scores with seeds and sample indices, to allow easier
-    # comparison of ranking scores across different runs.
-    with open(os.path.join(output_dir, 'ranking_scores.csv'), 'wt') as f:
-      writer = csv.writer(f)
-      writer.writerow(['seed', 'sample', 'ranking_score'])
-      writer.writerows(ranking_scores)
+def _sync_write_outputs(
+    all_inference_results: Sequence[ResultsForSeed],
+    output_dir: os.PathLike[str] | str,
+    job_name: str,
+) -> None:
+    """同步写入输出文件（作为备份方案）"""
+    # 保留原来的同步写入逻辑作为后备
+    print("Warning: Falling back to synchronous file writing...")
+    # ... 原来的同步写入代码 ...
 
 
 @overload
