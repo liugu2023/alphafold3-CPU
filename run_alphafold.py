@@ -499,9 +499,8 @@ def predict_structure_for_seed(
         inference_start_time = time.time()
         rng_key = jax.random.PRNGKey(seed)
         
-        # 使用JAX的设备内存管理
-        with jax.device_memory_scope():
-            result = model_runner.run_inference(featurised_example, rng_key)
+        # 运行推理
+        result = model_runner.run_inference(featurised_example, rng_key)
         
         print(
             f'Running model inference with seed {seed} took'
