@@ -624,22 +624,24 @@ def write_outputs(
 def process_fold_input(
     fold_input: folding_input.Input,
     data_pipeline_config: pipeline.DataPipelineConfig | None,
-    model_runner: None,
+    model_config: None,
+    model_dir: None,
     output_dir: os.PathLike[str] | str,
     buckets: Sequence[int] | None = None,
 ) -> folding_input.Input:
-  ...
+    ...
 
 
 @overload
 def process_fold_input(
     fold_input: folding_input.Input,
     data_pipeline_config: pipeline.DataPipelineConfig | None,
-    model_runner: ModelRunner,
+    model_config: model.Model.Config,
+    model_dir: pathlib.Path,
     output_dir: os.PathLike[str] | str,
     buckets: Sequence[int] | None = None,
 ) -> Sequence[ResultsForSeed]:
-  ...
+    ...
 
 
 def replace_db_dir(path_with_db_dir: str, db_dirs: Sequence[str]) -> str:
@@ -661,82 +663,82 @@ def replace_db_dir(path_with_db_dir: str, db_dirs: Sequence[str]) -> str:
 def process_fold_input(
     fold_input: folding_input.Input,
     data_pipeline_config: pipeline.DataPipelineConfig | None,
-    model_runner: ModelRunner | None,
+    model_config: model.Model.Config | None,
+    model_dir: pathlib.Path | None,
     output_dir: os.PathLike[str] | str,
     buckets: Sequence[int] | None = None,
     conformer_max_iterations: int | None = None,
 ) -> folding_input.Input | Sequence[ResultsForSeed]:
-  """Runs data pipeline and/or inference on a single fold input.
+    """Runs data pipeline and/or inference on a single fold input.
 
-  Args:
-    fold_input: Fold input to process.
-    data_pipeline_config: Data pipeline config to use. If None, skip the data
-      pipeline.
-    model_runner: Model runner to use. If None, skip inference.
-    output_dir: Output directory to write to.
-    buckets: Bucket sizes to pad the data to, to avoid excessive re-compilation
-      of the model. If None, calculate the appropriate bucket size from the
-      number of tokens. If not None, must be a sequence of at least one integer,
-      in strictly increasing order. Will raise an error if the number of tokens
-      is more than the largest bucket size.
-    conformer_max_iterations: Optional override for maximum number of iterations
-      to run for RDKit conformer search.
+    Args:
+        fold_input: Fold input to process.
+        data_pipeline_config: Data pipeline config to use. If None, skip the data
+            pipeline.
+        model_config: Model configuration to use. If None, skip inference.
+        model_dir: Path to model directory. Required if model_config is provided.
+        output_dir: Output directory to write to.
+        buckets: Bucket sizes to pad the data to, to avoid excessive re-compilation
+            of the model. If None, calculate the appropriate bucket size from the
+            number of tokens.
+        conformer_max_iterations: Optional override for maximum number of iterations
+            to run for RDKit conformer search.
 
-  Returns:
-    The processed fold input, or the inference results for each seed.
+    Returns:
+        The processed fold input, or the inference results for each seed.
 
-  Raises:
-    ValueError: If the fold input has no chains.
-  """
-  print(f'\nRunning fold job {fold_input.name}...')
+    Raises:
+        ValueError: If the fold input has no chains.
+    """
+    print(f'\nRunning fold job {fold_input.name}...')
 
-  if not fold_input.chains:
-    raise ValueError('Fold input has no chains.')
+    if not fold_input.chains:
+        raise ValueError('Fold input has no chains.')
 
-  if os.path.exists(output_dir) and os.listdir(output_dir):
-    new_output_dir = (
-        f'{output_dir}_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}'
-    )
-    print(
-        f'Output will be written in {new_output_dir} since {output_dir} is'
-        ' non-empty.'
-    )
-    output_dir = new_output_dir
-  else:
-    print(f'Output will be written in {output_dir}')
+    if os.path.exists(output_dir) and os.listdir(output_dir):
+        new_output_dir = (
+            f'{output_dir}_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}'
+        )
+        print(
+            f'Output will be written in {new_output_dir} since {output_dir} is'
+            ' non-empty.'
+        )
+        output_dir = new_output_dir
+    else:
+        print(f'Output will be written in {output_dir}')
 
-  if data_pipeline_config is None:
-    print('Skipping data pipeline...')
-  else:
-    print('Running data pipeline...')
-    fold_input = pipeline.DataPipeline(data_pipeline_config).process(fold_input)
+    if data_pipeline_config is None:
+        print('Skipping data pipeline...')
+    else:
+        print('Running data pipeline...')
+        fold_input = pipeline.DataPipeline(data_pipeline_config).process(fold_input)
 
-  write_fold_input_json(fold_input, output_dir)
-  if model_runner is None:
-    print('Skipping model inference...')
-    output = fold_input
-  else:
-    print(
-        f'Predicting 3D structure for {fold_input.name} with'
-        f' {len(fold_input.rng_seeds)} seed(s)...'
-    )
-    all_inference_results = predict_structure(
-        fold_input=fold_input,
-        model_config=model_runner._model_config,
-        model_dir=model_runner._model_dir,
-        buckets=buckets,
-        conformer_max_iterations=conformer_max_iterations,
-    )
-    print(f'Writing outputs with {len(fold_input.rng_seeds)} seed(s)...')
-    write_outputs(
-        all_inference_results=all_inference_results,
-        output_dir=output_dir,
-        job_name=fold_input.sanitised_name(),
-    )
-    output = all_inference_results
+    write_fold_input_json(fold_input, output_dir)
+    if model_config is None:
+        print('Skipping model inference...')
+        output = fold_input
+    else:
+        print(
+            f'Predicting 3D structure for {fold_input.name} with'
+            f' {len(fold_input.rng_seeds)} seed(s)...'
+        )
+        all_inference_results = predict_structure(
+            fold_input=fold_input,
+            model_config=model_config,
+            model_dir=model_dir,
+            buckets=buckets,
+            conformer_max_iterations=conformer_max_iterations,
+        )
+        print(f'Writing outputs with {len(fold_input.rng_seeds)} seed(s)...')
+        write_outputs(
+            all_inference_results=all_inference_results,
+            output_dir=output_dir,
+            job_name=fold_input.sanitised_name(),
+        )
+        output = all_inference_results
 
-  print(f'Fold job {fold_input.name} done, output written to {output_dir}\n')
-  return output
+    print(f'Fold job {fold_input.name} done, output written to {output_dir}\n')
+    return output
 
 
 def main(_):
@@ -842,8 +844,8 @@ def main(_):
     process_fold_input(
         fold_input=fold_input,
         data_pipeline_config=data_pipeline_config,
-        model_config=model_config,  # 传入配置而不是runner
-        model_dir=model_dir,        # 传入模型目录
+        model_config=model_config,
+        model_dir=model_dir,
         output_dir=os.path.join(_OUTPUT_DIR.value, fold_input.sanitised_name()),
         buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
         conformer_max_iterations=_CONFORMER_MAX_ITERATIONS.value,
