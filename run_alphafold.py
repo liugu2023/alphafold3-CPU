@@ -378,6 +378,18 @@ class ModelRunner:
             )
         return self._param_cache[param_key]
     
+    @functools.cached_property
+    def _model(self) -> Callable[[jnp.ndarray, features.BatchDict], model.ModelResult]:
+        """Loads model parameters and returns a jitted model forward pass."""
+        @hk.transform
+        def forward_fn(batch):
+            return model.Model(self._model_config)(batch)
+
+        return functools.partial(
+            jax.jit(forward_fn.apply, device=self._device), 
+            self._get_cached_params('')
+        )
+    
     def run_inference(
         self,
         featurised_example: features.BatchDict,
@@ -397,81 +409,106 @@ class ModelRunner:
             return cached_result
         
         # 计算新结果
-        result = super().run_inference(featurised_example, rng_key)
+        featurised_example = jax.device_put(
+            jax.tree_util.tree_map(
+                jnp.asarray, utils.remove_invalidly_typed_feats(featurised_example)
+            ),
+            self._device,
+        )
+
+        result = self._model(rng_key, featurised_example)
+        result = self.check_output_numerics(result)
+        result = jax.tree.map(np.asarray, result)
+        result = jax.tree.map(
+            lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x,
+            result,
+        )
+        result = dict(result)
+        identifier = self._get_cached_params('')['__meta__']['__identifier__'].tobytes()
+        result['__identifier__'] = identifier
+        
+        # 最后再次检查关键坐标数据
+        if 'structure_module' in result:
+            for key in ['final_atom_positions', 'final_atom_mask']:
+                if key in result['structure_module']:
+                    result['structure_module'][key] = self.fix_numerics(
+                        result['structure_module'][key], 
+                        f'structure_module.{key}'
+                    )
         
         # 缓存结果
         self._cache_manager.put(cache_key, result)
         
         return result
 
-  @staticmethod
-  def fix_numerics(value, key=""):
-    """修复数值问题的通用方法"""
-    if isinstance(value, (np.ndarray, jnp.ndarray)):
-      if np.any(np.isnan(value)) or np.any(np.isinf(value)):
-        print(f"Warning: Found NaN/inf in output {key}")
-        print(f"Shape: {value.shape}")
-        print(f"NaN count: {np.isnan(value).sum()}")
-        print(f"Inf count: {np.isinf(value).sum()}")
-        
-        # 对于坐标相关的键，使用更保守的替换值
-        if any(coord in key.lower() for coord in ['coord', 'pos', 'xyz', 'position']):
-          # 使用邻近的有效值填充
-          mask = np.isnan(value) | np.isinf(value)
-          if mask.any():
-            valid_values = value[~mask]
-            if len(valid_values) > 0:
-              # 使用有效值的平均值
-              fill_value = np.mean(valid_values)
+    @staticmethod
+    def fix_numerics(value, key=""):
+        """修复数值问题的通用方法"""
+        if isinstance(value, (np.ndarray, jnp.ndarray)):
+          if np.any(np.isnan(value)) or np.any(np.isinf(value)):
+            print(f"Warning: Found NaN/inf in output {key}")
+            print(f"Shape: {value.shape}")
+            print(f"NaN count: {np.isnan(value).sum()}")
+            print(f"Inf count: {np.isinf(value).sum()}")
+            
+            # 对于坐标相关的键，使用更保守的替换值
+            if any(coord in key.lower() for coord in ['coord', 'pos', 'xyz', 'position']):
+              # 使用邻近的有效值填充
+              mask = np.isnan(value) | np.isinf(value)
+              if mask.any():
+                valid_values = value[~mask]
+                if len(valid_values) > 0:
+                  # 使用有效值的平均值
+                  fill_value = np.mean(valid_values)
+                else:
+                  # 如果没有有效值，使用0
+                  fill_value = 0.0
+                value = np.where(mask, fill_value, value)
             else:
-              # 如果没有有效值，使用0
-              fill_value = 0.0
-            value = np.where(mask, fill_value, value)
-        else:
-          # 对于其他值使用标准替换
-          value = np.nan_to_num(value, nan=0.0, posinf=1e6, neginf=-1e6)
-      
-      # 确保数值在合理范围内
-      value = np.clip(value, -1e6, 1e6)
-    return value
+              # 对于其他值使用标准替换
+              value = np.nan_to_num(value, nan=0.0, posinf=1e6, neginf=-1e6)
+          
+          # 确保数值在合理范围内
+          value = np.clip(value, -1e6, 1e6)
+        return value
 
-  def check_output_numerics(self, result):
-    """检查并修复输出中的数值问题"""
-    def process_dict(d, parent_key=""):
-      for key, value in d.items():
-        full_key = f"{parent_key}.{key}" if parent_key else key
-        if isinstance(value, dict):
-          d[key] = process_dict(value, full_key)
-        else:
-          d[key] = self.fix_numerics(value, full_key)
-      return d
+    def check_output_numerics(self, result):
+        """检查并修复输出中的数值问题"""
+        def process_dict(d, parent_key=""):
+          for key, value in d.items():
+            full_key = f"{parent_key}.{key}" if parent_key else key
+            if isinstance(value, dict):
+              d[key] = process_dict(value, full_key)
+            else:
+              d[key] = self.fix_numerics(value, full_key)
+          return d
 
-    return process_dict(result)
+        return process_dict(result)
 
-  def extract_structures(
-      self,
-      batch: features.BatchDict,
-      result: model.ModelResult,
-      target_name: str,
-  ) -> list[model.InferenceResult]:
-    """Generates structures from model outputs."""
-    return list(
-        model.Model.get_inference_result(
-            batch=batch, result=result, target_name=target_name
+    def extract_structures(
+        self,
+        batch: features.BatchDict,
+        result: model.ModelResult,
+        target_name: str,
+    ) -> list[model.InferenceResult]:
+        """Generates structures from model outputs."""
+        return list(
+            model.Model.get_inference_result(
+                batch=batch, result=result, target_name=target_name
+            )
         )
-    )
 
-  def extract_embeddings(
-      self,
-      result: model.ModelResult,
-  ) -> dict[str, np.ndarray] | None:
-    """Extracts embeddings from model outputs."""
-    embeddings = {}
-    if 'single_embeddings' in result:
-      embeddings['single_embeddings'] = result['single_embeddings']
-    if 'pair_embeddings' in result:
-      embeddings['pair_embeddings'] = result['pair_embeddings']
-    return embeddings or None
+    def extract_embeddings(
+        self,
+        result: model.ModelResult,
+    ) -> dict[str, np.ndarray] | None:
+        """Extracts embeddings from model outputs."""
+        embeddings = {}
+        if 'single_embeddings' in result:
+          embeddings['single_embeddings'] = result['single_embeddings']
+        if 'pair_embeddings' in result:
+          embeddings['pair_embeddings'] = result['pair_embeddings']
+        return embeddings or None
 
 
 @dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
