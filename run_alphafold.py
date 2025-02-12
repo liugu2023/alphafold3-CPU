@@ -34,6 +34,7 @@ import time
 import typing
 from typing import overload
 from concurrent.futures import ProcessPoolExecutor
+import concurrent.futures
 
 from absl import app
 from absl import flags
@@ -500,14 +501,38 @@ def predict_structure_for_seed(
     )
 
 
+def process_batch(
+    batch_tasks: list[tuple[int, features.BatchDict]],
+    model_config: model.Model.Config,
+    model_dir: pathlib.Path,
+    fold_input: folding_input.Input,
+) -> list[ResultsForSeed]:
+    """处理一批预测任务"""
+    results = []
+    for seed, featurised_example in batch_tasks:
+        try:
+            result = predict_structure_for_seed(
+                seed=seed,
+                featurised_example=featurised_example,
+                model_config=model_config,
+                model_dir=model_dir,
+                fold_input=fold_input,
+            )
+            results.append(result)
+        except Exception as e:
+            print(f"Error processing seed {seed}: {e}")
+            continue
+    return results
+
+
 def predict_structure(
     fold_input: folding_input.Input,
-    model_config: model.Model.Config,  # 改为传入配置而不是runner
-    model_dir: pathlib.Path,          # 传入模型目录
+    model_config: model.Model.Config,
+    model_dir: pathlib.Path,
     buckets: Sequence[int] | None = None,
     conformer_max_iterations: int | None = None,
 ) -> Sequence[ResultsForSeed]:
-    """并行运行推理管道来预测每个seed的结构"""
+    """使用动态负载均衡并行运行推理管道"""
     
     print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
     featurisation_start_time = time.time()
@@ -520,42 +545,82 @@ def predict_structure(
         conformer_max_iterations=conformer_max_iterations,
     )
     print(
-        f'Featurising data with {len(fold_input.rng_seeds)} seed(s) took'
-        f' {time.time() - featurisation_start_time:.2f} seconds.'
+        f'Featurising data took {time.time() - featurisation_start_time:.2f} seconds.'
     )
 
-    # 确定最佳进程数
+    # 确定最佳进程数和批次大小
     num_cpus = multiprocessing.cpu_count()
     num_workers = min(len(fold_input.rng_seeds), max(1, num_cpus - 1))
     
+    # 动态计算批次大小：每个CPU核心处理2-3个任务
+    tasks_per_cpu = 2
+    batch_size = max(1, min(
+        len(fold_input.rng_seeds) // (num_workers * tasks_per_cpu),
+        3  # 最大批次大小
+    ))
+    
+    # 将任务分成批次
+    all_tasks = list(zip(fold_input.rng_seeds, featurised_examples))
+    batched_tasks = [
+        all_tasks[i:i + batch_size] 
+        for i in range(0, len(all_tasks), batch_size)
+    ]
+    
     print(
-        f'Running parallel model inference with {num_workers} workers for'
-        f' {len(fold_input.rng_seeds)} seed(s)...'
+        f'Running parallel model inference with {num_workers} workers,'
+        f' {len(batched_tasks)} batches (batch_size={batch_size})...'
     )
     all_inference_start_time = time.time()
     
+    all_results = []
+    completed_batches = 0
+    total_batches = len(batched_tasks)
+    
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        futures = [
+        # 提交所有批次任务
+        future_to_batch = {
             executor.submit(
-                predict_structure_for_seed,
-                seed,
-                example,
-                model_config,  # 传入配置
-                model_dir,     # 传入模型目录
+                process_batch,
+                batch,
+                model_config,
+                model_dir,
                 fold_input,
-            )
-            for seed, example in zip(fold_input.rng_seeds, featurised_examples)
-        ]
+            ): i 
+            for i, batch in enumerate(batched_tasks)
+        }
         
-        all_inference_results = [future.result() for future in futures]
+        # 动态处理完成的任务
+        for future in concurrent.futures.as_completed(future_to_batch):
+            batch_index = future_to_batch[future]
+            try:
+                batch_results = future.result()
+                all_results.extend(batch_results)
+                completed_batches += 1
+                
+                # 打印进度
+                progress = (completed_batches / total_batches) * 100
+                elapsed_time = time.time() - all_inference_start_time
+                eta = (elapsed_time / completed_batches) * (total_batches - completed_batches)
+                
+                print(
+                    f'Completed batch {completed_batches}/{total_batches}'
+                    f' ({progress:.1f}%) - ETA: {eta:.1f}s'
+                )
+                
+            except Exception as e:
+                print(f"Error in batch {batch_index}: {e}")
+                continue
+    
+    # 按seed排序结果
+    all_results.sort(key=lambda x: x.seed)
     
     print(
-        'Running parallel model inference and extracting output structures with'
-        f' {len(fold_input.rng_seeds)} seed(s) took'
+        'Completed parallel model inference and extraction with'
+        f' {len(fold_input.rng_seeds)} seed(s) in'
         f' {time.time() - all_inference_start_time:.2f} seconds.'
     )
     
-    return all_inference_results
+    return all_results
 
 
 def write_fold_input_json(
