@@ -448,16 +448,49 @@ class ResultsForSeed:
 
 
 def create_model_runner(model_config, model_dir):
-    """在每个进程中创建ModelRunner"""
+    """在每个进程中创建ModelRunner，添加计算优化"""
+    # 设置JAX优化选项
+    jax.config.update('jax_enable_x64', False)  # 使用float32以提高性能
+    jax.config.update('jax_default_matmul_precision', 'bfloat16')  # 使用bfloat16加速矩阵运算
+    
+    # 设置CPU线程数
+    num_physical_cores = psutil.cpu_count(logical=False)  # 物理核心数
+    threads_per_core = 2  # 每个核心的线程数
+    
+    # 为每个进程分配合适的线程数
+    process_threads = max(1, num_physical_cores // 2)
+    
+    # 设置线程亲和性和线程数
+    os.environ['OMP_NUM_THREADS'] = str(process_threads)
+    os.environ['MKL_NUM_THREADS'] = str(process_threads)
+    os.environ['OPENBLAS_NUM_THREADS'] = str(process_threads)
+    os.environ['VECLIB_MAXIMUM_THREADS'] = str(process_threads)
+    
+    # 启用Intel MKL优化
+    os.environ['MKL_DEBUG_CPU_TYPE'] = '5'  # 启用高级指令集
+    os.environ['MKL_ENABLE_INSTRUCTIONS'] = 'AVX2'  # 使用AVX2指令集
+    
+    # 设置CPU亲和性策略
+    os.environ['KMP_AFFINITY'] = 'granularity=fine,compact,1,0'
+    
+    # 优化内存分配
+    os.environ['MKL_DYNAMIC'] = 'FALSE'  # 禁用动态调整以提高稳定性
+    
+    print(f"Optimized thread settings:")
+    print(f"Physical cores: {num_physical_cores}")
+    print(f"Threads per process: {process_threads}")
+    
     # 使用CPU设备
     devices = jax.local_devices(backend='cpu')
     print(f'Creating model runner with CPU device: {devices[0]}')
     
+    # 创建优化后的ModelRunner
     model_runner = ModelRunner(
         config=model_config,
         device=devices[0],
         model_dir=model_dir,
     )
+    
     return model_runner
 
 
@@ -486,7 +519,7 @@ def predict_structure_for_seed(
     model_dir: pathlib.Path,
     fold_input: folding_input.Input,
 ) -> ResultsForSeed:
-    """处理单个seed的预测，添加内存优化"""
+    """处理单个seed的预测，添加计算优化"""
     
     with memory_tracker("Model Runner Creation"):
         model_runner = create_model_runner(model_config, model_dir)
@@ -497,10 +530,16 @@ def predict_structure_for_seed(
     with memory_tracker("Model Inference"):
         print(f'Running model inference with seed {seed}...')
         inference_start_time = time.time()
+        
+        # 使用确定性的随机数生成
         rng_key = jax.random.PRNGKey(seed)
         
-        # 运行推理
-        result = model_runner.run_inference(featurised_example, rng_key)
+        # 运行推理，添加XLA优化
+        with jax.disable_jit(False):  # 确保JIT编译开启
+            result = model_runner.run_inference(
+                featurised_example,
+                rng_key,
+            )
         
         print(
             f'Running model inference with seed {seed} took'
@@ -511,11 +550,14 @@ def predict_structure_for_seed(
     with memory_tracker("Structure Extraction"):
         print(f'Extracting output structure samples with seed {seed}...')
         extract_structures = time.time()
+        
+        # 使用优化后的结构提取
         inference_results = model_runner.extract_structures(
             batch=featurised_example, 
             result=result,
             target_name=fold_input.name
         )
+        
         print(
             f'Extracting {len(inference_results)} output structure samples with'
             f' seed {seed} took {time.time() - extract_structures:.2f} seconds.'
