@@ -442,12 +442,31 @@ class ResultsForSeed:
   embeddings: dict[str, np.ndarray] | None = None
 
 
+def create_model_runner(model_config, model_dir):
+    """在每个进程中创建ModelRunner"""
+    # 使用CPU设备
+    devices = jax.local_devices(backend='cpu')
+    print(f'Creating model runner with CPU device: {devices[0]}')
+    
+    model_runner = ModelRunner(
+        config=model_config,
+        device=devices[0],
+        model_dir=model_dir,
+    )
+    return model_runner
+
+
 def predict_structure_for_seed(
     seed: int,
     featurised_example: features.BatchDict,
-    model_runner: ModelRunner,
+    model_config: model.Model.Config,
+    model_dir: pathlib.Path,
+    fold_input: folding_input.Input,
 ) -> ResultsForSeed:
     """处理单个seed的预测"""
+    # 在子进程中创建model_runner
+    model_runner = create_model_runner(model_config, model_dir)
+    
     print(f'Running model inference with seed {seed}...')
     inference_start_time = time.time()
     rng_key = jax.random.PRNGKey(seed)
@@ -481,7 +500,8 @@ def predict_structure_for_seed(
 
 def predict_structure(
     fold_input: folding_input.Input,
-    model_runner: ModelRunner,
+    model_config: model.Model.Config,  # 改为传入配置而不是runner
+    model_dir: pathlib.Path,          # 传入模型目录
     buckets: Sequence[int] | None = None,
     conformer_max_iterations: int | None = None,
 ) -> Sequence[ResultsForSeed]:
@@ -518,7 +538,9 @@ def predict_structure(
                 predict_structure_for_seed,
                 seed,
                 example,
-                model_runner,
+                model_config,  # 传入配置
+                model_dir,     # 传入模型目录
+                fold_input,
             )
             for seed, example in zip(fold_input.rng_seeds, featurised_examples)
         ]
@@ -700,7 +722,8 @@ def process_fold_input(
     )
     all_inference_results = predict_structure(
         fold_input=fold_input,
-        model_runner=model_runner,
+        model_config=model_runner._model_config,
+        model_dir=model_runner._model_dir,
         buckets=buckets,
         conformer_max_iterations=conformer_max_iterations,
     )
@@ -794,26 +817,22 @@ def main(_):
     data_pipeline_config = None
 
   if _RUN_INFERENCE.value:
-    # 使用CPU设备
-    devices = jax.local_devices(backend='cpu')
-    print(f'Using CPU device: {devices[0]}')
-
-    print('Building model from scratch...')
-    model_runner = ModelRunner(
-        config=make_model_config(
-            flash_attention_implementation='xla',  # CPU只支持XLA实现
-            num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
-            num_recycles=_NUM_RECYCLES.value,
-            return_embeddings=_SAVE_EMBEDDINGS.value,
-        ),
-        device=devices[0],  # 使用第一个CPU设备
-        model_dir=pathlib.Path(MODEL_DIR.value),
+    # 创建模型配置
+    model_config = make_model_config(
+        flash_attention_implementation='xla',  # CPU只支持XLA实现
+        num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
+        num_recycles=_NUM_RECYCLES.value,
+        return_embeddings=_SAVE_EMBEDDINGS.value,
     )
-    # 检查模型参数加载
+    model_dir = pathlib.Path(MODEL_DIR.value)
+    
+    # 检查模型参数是否可以加载
     print('Checking that model parameters can be loaded...')
-    _ = model_runner.model_params
+    test_runner = create_model_runner(model_config, model_dir)
+    _ = test_runner.model_params
   else:
-    model_runner = None
+    model_config = None
+    model_dir = None
 
   num_fold_inputs = 0
   for fold_input in fold_inputs:
@@ -823,7 +842,8 @@ def main(_):
     process_fold_input(
         fold_input=fold_input,
         data_pipeline_config=data_pipeline_config,
-        model_runner=model_runner,
+        model_config=model_config,  # 传入配置而不是runner
+        model_dir=model_dir,        # 传入模型目录
         output_dir=os.path.join(_OUTPUT_DIR.value, fold_input.sanitised_name()),
         buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
         conformer_max_iterations=_CONFORMER_MAX_ITERATIONS.value,
