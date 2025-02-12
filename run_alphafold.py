@@ -54,6 +54,8 @@ import jax
 from jax import numpy as jnp
 import numpy as np
 
+# 在导入语句后，主程序开始前设置
+multiprocessing.set_start_method('spawn', force=True)
 
 _HOME_DIR = pathlib.Path(os.environ.get('HOME'))
 _DEFAULT_MODEL_DIR = _HOME_DIR / 'models'
