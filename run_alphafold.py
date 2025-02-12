@@ -32,11 +32,13 @@ import string
 import textwrap
 import time
 import typing
-from typing import overload
+from typing import overload, Dict, Any, Tuple, Optional
 from concurrent.futures import ProcessPoolExecutor
 import psutil
 import gc
 from contextlib import contextmanager
+import hashlib
+import json
 
 from absl import app
 from absl import flags
@@ -294,37 +296,113 @@ def make_model_config(
   return config
 
 
+class CacheManager:
+    """管理计算结果缓存"""
+    def __init__(self, cache_dir: Optional[pathlib.Path] = None):
+        self._memory_cache: Dict[str, Any] = {}
+        self._cache_dir = cache_dir or pathlib.Path('/tmp/alphafold_cache')
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
+        self._hits = 0
+        self._misses = 0
+    
+    def _get_cache_key(self, *args, **kwargs) -> str:
+        """生成缓存键"""
+        # 将参数转换为可哈希的形式
+        def make_hashable(obj):
+            if isinstance(obj, (dict, list, set)):
+                return json.dumps(obj, sort_keys=True)
+            if isinstance(obj, np.ndarray):
+                return obj.tobytes()
+            return str(obj)
+        
+        key_parts = [make_hashable(arg) for arg in args]
+        key_parts.extend(f"{k}:{make_hashable(v)}" for k, v in sorted(kwargs.items()))
+        return hashlib.sha256(''.join(key_parts).encode()).hexdigest()
+    
+    def get(self, key: str) -> Optional[Any]:
+        """获取缓存的结果"""
+        # 先检查内存缓存
+        if key in self._memory_cache:
+            self._hits += 1
+            return self._memory_cache[key]
+        
+        # 检查磁盘缓存
+        cache_file = self._cache_dir / f"{key}.npz"
+        if cache_file.exists():
+            self._hits += 1
+            try:
+                with np.load(cache_file, allow_pickle=True) as data:
+                    result = dict(data)
+                    self._memory_cache[key] = result
+                    return result
+            except Exception as e:
+                print(f"Failed to load cache: {e}")
+        
+        self._misses += 1
+        return None
+    
+    def put(self, key: str, value: Any):
+        """存储结果到缓存"""
+        self._memory_cache[key] = value
+        cache_file = self._cache_dir / f"{key}.npz"
+        try:
+            np.savez_compressed(cache_file, **value)
+        except Exception as e:
+            print(f"Failed to save cache: {e}")
+    
+    def get_stats(self) -> Tuple[int, int]:
+        """返回缓存命中和未命中次数"""
+        return self._hits, self._misses
+
+
 class ModelRunner:
-  """Helper class to run structure prediction stages."""
-
-  def __init__(
-      self,
-      config: model.Model.Config,
-      device: jax.Device,
-      model_dir: pathlib.Path,
-  ):
-    self._model_config = config
-    self._device = device
-    self._model_dir = model_dir
-
-  @functools.cached_property
-  def model_params(self) -> hk.Params:
-    """Loads model parameters from the model directory."""
-    return params.get_model_haiku_params(model_dir=self._model_dir)
-
-  @functools.cached_property
-  def _model(
-      self,
-  ) -> Callable[[jnp.ndarray, features.BatchDict], model.ModelResult]:
-    """Loads model parameters and returns a jitted model forward pass."""
-
-    @hk.transform
-    def forward_fn(batch):
-      return model.Model(self._model_config)(batch)
-
-    return functools.partial(
-        jax.jit(forward_fn.apply, device=self._device), self.model_params
-    )
+    """添加缓存机制的ModelRunner"""
+    def __init__(
+        self,
+        config: model.Model.Config,
+        device: jax.Device,
+        model_dir: pathlib.Path,
+    ):
+        self._model_config = config
+        self._device = device
+        self._model_dir = model_dir
+        self._cache_manager = CacheManager()
+        self._param_cache = {}
+    
+    @functools.lru_cache(maxsize=32)
+    def _get_cached_params(self, param_key: str):
+        """缓存模型参数"""
+        if param_key not in self._param_cache:
+            self._param_cache[param_key] = params.get_model_haiku_params(
+                model_dir=self._model_dir
+            )
+        return self._param_cache[param_key]
+    
+    def run_inference(
+        self,
+        featurised_example: features.BatchDict,
+        rng_key: jnp.ndarray,
+    ) -> model.ModelResult:
+        """运行推理，添加结果缓存"""
+        cache_key = self._cache_manager._get_cache_key(
+            featurised_example,
+            rng_key,
+            self._model_config
+        )
+        
+        # 检查缓存
+        cached_result = self._cache_manager.get(cache_key)
+        if cached_result is not None:
+            print("Using cached result")
+            return cached_result
+        
+        # 计算新结果
+        result = super().run_inference(featurised_example, rng_key)
+        
+        # 缓存结果
+        self._cache_manager.put(cache_key, result)
+        
+        return result
 
   @staticmethod
   def fix_numerics(value, key=""):
@@ -369,39 +447,6 @@ class ModelRunner:
       return d
 
     return process_dict(result)
-
-  def run_inference(
-      self, featurised_example: features.BatchDict, rng_key: jnp.ndarray
-  ) -> model.ModelResult:
-    """Computes a forward pass of the model on a featurised example."""
-    featurised_example = jax.device_put(
-        jax.tree_util.tree_map(
-            jnp.asarray, utils.remove_invalidly_typed_feats(featurised_example)
-        ),
-        self._device,
-    )
-
-    result = self._model(rng_key, featurised_example)
-    result = self.check_output_numerics(result)
-    result = jax.tree.map(np.asarray, result)
-    result = jax.tree.map(
-        lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x,
-        result,
-    )
-    result = dict(result)
-    identifier = self.model_params['__meta__']['__identifier__'].tobytes()
-    result['__identifier__'] = identifier
-    
-    # 最后再次检查关键坐标数据
-    if 'structure_module' in result:
-        for key in ['final_atom_positions', 'final_atom_mask']:
-            if key in result['structure_module']:
-                result['structure_module'][key] = self.fix_numerics(
-                    result['structure_module'][key], 
-                    f'structure_module.{key}'
-                )
-    
-    return result
 
   def extract_structures(
       self,
@@ -519,7 +564,7 @@ def predict_structure_for_seed(
     model_dir: pathlib.Path,
     fold_input: folding_input.Input,
 ) -> ResultsForSeed:
-    """处理单个seed的预测，添加计算优化"""
+    """处理单个seed的预测，添加缓存优化"""
     
     with memory_tracker("Model Runner Creation"):
         model_runner = create_model_runner(model_config, model_dir)
@@ -534,12 +579,12 @@ def predict_structure_for_seed(
         # 使用确定性的随机数生成
         rng_key = jax.random.PRNGKey(seed)
         
-        # 运行推理，添加XLA优化
-        with jax.disable_jit(False):  # 确保JIT编译开启
-            result = model_runner.run_inference(
-                featurised_example,
-                rng_key,
-            )
+        # 运行推理，使用缓存
+        result = model_runner.run_inference(featurised_example, rng_key)
+        
+        # 打印缓存统计
+        hits, misses = model_runner._cache_manager.get_stats()
+        print(f"Cache stats - hits: {hits}, misses: {misses}")
         
         print(
             f'Running model inference with seed {seed} took'
@@ -934,7 +979,7 @@ def main(_):
     # 检查模型参数是否可以加载
     print('Checking that model parameters can be loaded...')
     test_runner = create_model_runner(model_config, model_dir)
-    _ = test_runner.model_params
+    _ = test_runner._get_cached_params('')
   else:
     model_config = None
     model_dir = None
