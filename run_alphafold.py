@@ -32,7 +32,7 @@ import string
 import textwrap
 import time
 import typing
-from typing import overload, Dict, Any, Tuple, Optional
+from typing import overload, Dict, Any, Tuple, Optional, List
 from concurrent.futures import ProcessPoolExecutor
 import psutil
 import gc
@@ -276,6 +276,25 @@ _SAVE_EMBEDDINGS = flags.DEFINE_bool(
     'save_embeddings',
     False,
     'Whether to save the final trunk single and pair embeddings in the output.',
+)
+
+# 添加新的配置选项
+_BATCH_SIZE = flags.DEFINE_integer(
+    'batch_size',
+    1024,  # 默认批次大小
+    'Batch size for processing large inputs',
+)
+
+_MAX_MEMORY_USAGE = flags.DEFINE_float(
+    'max_memory_usage',
+    0.9,  # 默认使用90%的系统内存
+    'Maximum fraction of system memory to use',
+)
+
+_DISK_CACHE_DIR = flags.DEFINE_string(
+    'disk_cache_dir',
+    None,
+    'Directory for disk caching. If not set, will use system temp directory',
 )
 
 
@@ -630,39 +649,230 @@ def memory_tracker(operation_name: str):
         print(f"Time: {end_time - start_time:.2f} seconds")
 
 
-def predict_structure_for_seed(
+def calculate_optimal_batch_size(
+    input_size: int,
+    available_memory: int,
+    model_memory_factor: float = 0.3,  # 模型预计占用内存的因子
+) -> int:
+    """根据输入大小和可用内存自动计算最优batch size"""
+    # 估算每个token的内存使用
+    estimated_memory_per_token = 2048  # 每个token大约使用2KB内存(包括中间结果)
+    
+    # 计算可用于batch的内存
+    usable_memory = int(available_memory * _MAX_MEMORY_USAGE.value * model_memory_factor)
+    
+    # 计算理论上的最大batch size
+    max_batch_size = usable_memory // estimated_memory_per_token
+    
+    # 根据输入大小调整batch size
+    if input_size <= 1024:
+        # 小输入直接处理
+        return input_size
+    elif input_size <= 2048:
+        # 中等输入分2-4批
+        return max(512, min(input_size // 2, max_batch_size))
+    else:
+        # 大输入根据内存动态调整
+        optimal_batch_size = min(
+            max_batch_size,
+            max(256, input_size // (input_size // 1024 + 1))
+        )
+        
+        # 确保batch size是256的倍数，有助于性能优化
+        optimal_batch_size = (optimal_batch_size // 256) * 256
+        
+        return max(256, optimal_batch_size)
+
+
+def monitor_system_resources(
+    pid: int,
+    check_interval: int = 60,  # 每分钟检查一次
+    cpu_stall_threshold: float = 1.0,  # CPU使用率低于1%视为停滞
+    memory_change_threshold: float = 0.01,  # 内存变化小于1%视为停滞
+    stall_duration: int = 600,  # 10分钟无变化视为停滞
+) -> bool:
+    """监控进程的系统资源使用情况"""
+    try:
+        process = psutil.Process(pid)
+        last_cpu = process.cpu_percent()
+        last_memory = process.memory_info().rss
+        last_active_time = time.time()
+        
+        while True:
+            time.sleep(check_interval)
+            
+            try:
+                current_cpu = process.cpu_percent()
+                current_memory = process.memory_info().rss
+                
+                # 计算资源变化
+                cpu_change = abs(current_cpu - last_cpu)
+                memory_change_ratio = abs(current_memory - last_memory) / last_memory
+                
+                # 检查是否有实质性变化
+                if (cpu_change > cpu_stall_threshold or 
+                    memory_change_ratio > memory_change_threshold):
+                    last_active_time = time.time()
+                
+                # 检查是否停滞太久
+                if time.time() - last_active_time > stall_duration:
+                    print(f"Process appears stalled:")
+                    print(f"CPU usage: {current_cpu:.1f}%")
+                    print(f"Memory: {current_memory / 1024 / 1024:.1f} MB")
+                    print(f"No significant changes for {stall_duration/60:.1f} minutes")
+                    return False
+                
+                last_cpu = current_cpu
+                last_memory = current_memory
+                
+            except psutil.NoSuchProcess:
+                print("Process terminated unexpectedly")
+                return False
+            
+    except Exception as e:
+        print(f"Error monitoring resources: {e}")
+        return False
+
+
+def predict_structure_for_large_input(
     seed: int,
     featurised_example: features.BatchDict,
     model_config: model.Model.Config,
     model_dir: pathlib.Path,
     fold_input: folding_input.Input,
 ) -> ResultsForSeed:
-    """处理单个seed的预测，添加缓存优化"""
+    """处理大型输入的预测，添加资源监控"""
+    
+    # 获取输入大小
+    input_size = featurised_example['seq_length']
+    
+    # 获取系统可用内存
+    available_memory = psutil.virtual_memory().available
+    
+    # 计算最优batch size
+    optimal_batch_size = calculate_optimal_batch_size(
+        input_size=input_size,
+        available_memory=available_memory
+    )
+    
+    print(f"Input size: {input_size}")
+    print(f"Available memory: {available_memory / (1024**3):.2f} GB")
+    print(f"Calculated optimal batch size: {optimal_batch_size}")
+    
+    def split_batch(batch: features.BatchDict, batch_size: int):
+        """将大型batch分割成更小的部分"""
+        total_size = batch['seq_length']
+        num_batches = (total_size + batch_size - 1) // batch_size
+        
+        # 动态调整最后一个batch的大小，避免过小的batch
+        if num_batches > 1:
+            last_batch_size = total_size % batch_size
+            if last_batch_size > 0 and last_batch_size < batch_size * 0.5:
+                # 如果最后一个batch太小，将其数据分配到前面的batches
+                batch_size = total_size // (num_batches - 1)
+        
+        batches = []
+        for i in range((total_size + batch_size - 1) // batch_size):
+            start_idx = i * batch_size
+            end_idx = min((i + 1) * batch_size, total_size)
+            
+            sub_batch = {}
+            for key, value in batch.items():
+                if isinstance(value, np.ndarray):
+                    if value.shape[0] == total_size:
+                        sub_batch[key] = value[start_idx:end_idx]
+                    else:
+                        sub_batch[key] = value
+                else:
+                    sub_batch[key] = value
+            
+            batches.append(sub_batch)
+        
+        return batches
     
     with memory_tracker("Model Runner Creation"):
         model_runner = create_model_runner(model_config, model_dir)
     
-    # 清理不需要的缓存
-    gc.collect()
+    # 分批处理
+    batches = split_batch(featurised_example, optimal_batch_size)
     
-    with memory_tracker("Model Inference"):
-        print(f'Running model inference with seed {seed}...')
-        inference_start_time = time.time()
-        
-        # 使用确定性的随机数生成
-        rng_key = jax.random.PRNGKey(seed)
-        
-        # 运行推理，使用缓存
-        result = model_runner.run_inference(featurised_example, rng_key)
-        
-        # 打印缓存统计
-        hits, misses = model_runner._cache_manager.get_stats()
-        print(f"Cache stats - hits: {hits}, misses: {misses}")
-        
-        print(
-            f'Running model inference with seed {seed} took'
-            f' {time.time() - inference_start_time:.2f} seconds.'
-        )
+    # 打印批处理信息
+    print(f"Split into {len(batches)} batches:")
+    for i, batch in enumerate(batches):
+        print(f"Batch {i+1}: size = {batch['seq_length']}")
+    
+    results = []
+    last_heartbeat = time.time()
+    
+    # 创建资源监控进程
+    monitor_process = multiprocessing.Process(
+        target=monitor_system_resources,
+        args=(os.getpid(),),
+    )
+    monitor_process.start()
+    
+    try:
+        with memory_tracker("Model Inference"):
+            print(f'Running model inference with seed {seed} in {len(batches)} batches...')
+            inference_start_time = time.time()
+            
+            for batch_idx, batch in enumerate(batches):
+                # 心跳日志
+                current_time = time.time()
+                if current_time - last_heartbeat > 300:  # 每5分钟打印一次心跳
+                    print(f"Heartbeat - Still processing batch {batch_idx + 1}")
+                    print(f"Time elapsed: {(current_time - start_time) / 60:.1f} minutes")
+                    last_heartbeat = current_time
+                
+                print(f'Processing batch {batch_idx + 1}/{len(batches)}...')
+                batch_start_time = time.time()
+                
+                # 等待内存可用
+                while psutil.virtual_memory().percent > _MAX_MEMORY_USAGE.value * 100:
+                    print("Waiting for memory to be available...")
+                    time.sleep(10)
+                    gc.collect()
+                
+                try:
+                    # 运行推理
+                    rng_key = jax.random.fold_in(jax.random.PRNGKey(seed), batch_idx)
+                    result = model_runner.run_inference(batch, rng_key)
+                    results.append(result)
+                    
+                except Exception as e:
+                    print(f"Error processing batch {batch_idx + 1}: {e}")
+                    if batch_idx == 0:
+                        raise  # 如果第一个batch就失败，直接抛出异常
+                    continue
+                
+                batch_time = time.time() - batch_start_time
+                print(f"Batch {batch_idx + 1} completed in {batch_time:.2f} seconds")
+                
+                # 主动释放内存
+                gc.collect()
+            
+            if not results:
+                raise RuntimeError("No batches were successfully processed")
+            
+            # 合并结果
+            try:
+                combined_result = combine_batch_results(results)
+            except Exception as e:
+                print(f"Error combining results: {e}")
+                # 尝试使用部分结果
+                if len(results) > 0:
+                    print("Attempting to continue with partial results...")
+                    combined_result = results[0]  # 使用第一个成功的结果
+                else:
+                    raise
+            
+            total_time = time.time() - inference_start_time
+            print(f'Total inference time: {total_time:.2f} seconds')
+    
+    finally:
+        # 确保清理监控进程
+        monitor_process.terminate()
+        monitor_process.join()
     
     # 提取需要的数据后释放大型中间结果
     with memory_tracker("Structure Extraction"):
@@ -672,7 +882,7 @@ def predict_structure_for_seed(
         # 使用优化后的结构提取
         inference_results = model_runner.extract_structures(
             batch=featurised_example, 
-            result=result,
+            result=combined_result,
             target_name=fold_input.name
         )
         
@@ -681,10 +891,10 @@ def predict_structure_for_seed(
             f' seed {seed} took {time.time() - extract_structures:.2f} seconds.'
         )
         
-        embeddings = model_runner.extract_embeddings(result)
+        embeddings = model_runner.extract_embeddings(combined_result)
         
         # 释放大型中间结果
-        del result
+        del combined_result
         del model_runner
         gc.collect()
     
@@ -701,39 +911,45 @@ def worker_process(
     result_queue: multiprocessing.Queue,
     model_config: model.Model.Config,
     model_dir: pathlib.Path,
+    max_retries: int = 3,
 ):
-    """工作进程处理函数"""
+    """工作进程处理函数，基于资源监控进行重试"""
     try:
         while True:
             try:
-                # 非阻塞方式获取任务
                 task = task_queue.get_nowait()
             except queue.Empty:
-                # 没有任务时退出
                 break
             
             seed, featurised_example, fold_input = task
             
-            try:
-                with memory_tracker(f"Worker Process {os.getpid()}"):
-                    result = predict_structure_for_seed(
-                        seed=seed,
-                        featurised_example=featurised_example,
-                        model_config=model_config,
-                        model_dir=model_dir,
-                        fold_input=fold_input,
-                    )
-                    result_queue.put((seed, result))
-            except Exception as e:
-                print(f"Error in worker {os.getpid()} processing seed {seed}: {e}")
-                result_queue.put((seed, e))
-            
-            # 主动清理内存
-            gc.collect()
-            
+            for retry in range(max_retries):
+                try:
+                    with memory_tracker(f"Worker Process {os.getpid()}"):
+                        result = predict_structure_for_large_input(
+                            seed=seed,
+                            featurised_example=featurised_example,
+                            model_config=model_config,
+                            model_dir=model_dir,
+                            fold_input=fold_input,
+                        )
+                        result_queue.put((seed, result))
+                        break
+                except Exception as e:
+                    print(f"Error in worker {os.getpid()} processing seed {seed}: {e}")
+                    if retry == max_retries - 1:
+                        result_queue.put((seed, e))
+                    else:
+                        print(f"Retrying... ({retry + 1}/{max_retries})")
+                        time.sleep(60)  # 等待1分钟后重试
+                
+                # 主动清理内存
+                gc.collect()
+    
     except Exception as e:
         print(f"Worker process {os.getpid()} failed: {e}")
         raise
+
 
 def predict_structure(
     fold_input: folding_input.Input,
