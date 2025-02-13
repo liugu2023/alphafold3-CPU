@@ -20,6 +20,7 @@ https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md
 """
 
 import os
+import multiprocessing
 # 禁用ROCM和TPU检测
 os.environ['JAX_PLATFORMS'] = 'cpu'  # 只使用CPU
 os.environ['JAX_PLATFORM_NAME'] = 'cpu'
@@ -38,8 +39,6 @@ import csv
 import dataclasses
 import datetime
 import functools
-import multiprocessing
-import os
 import pathlib
 import shutil
 import string
