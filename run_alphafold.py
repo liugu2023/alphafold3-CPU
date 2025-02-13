@@ -652,14 +652,15 @@ def memory_tracker(operation_name: str):
 def calculate_optimal_batch_size(
     input_size: int,
     available_memory: int,
-    model_memory_factor: float = 0.3,  # 模型预计占用内存的因子
+    max_memory_usage: float,  # 作为参数传入而不是直接访问flag
+    model_memory_factor: float = 0.3,
 ) -> int:
     """根据输入大小和可用内存自动计算最优batch size"""
     # 估算每个token的内存使用
     estimated_memory_per_token = 2048  # 每个token大约使用2KB内存(包括中间结果)
     
     # 计算可用于batch的内存
-    usable_memory = int(available_memory * _MAX_MEMORY_USAGE.value * model_memory_factor)
+    usable_memory = int(available_memory * max_memory_usage * model_memory_factor)
     
     # 计算理论上的最大batch size
     max_batch_size = usable_memory // estimated_memory_per_token
@@ -749,10 +750,11 @@ def predict_structure_for_large_input(
     # 获取系统可用内存
     available_memory = psutil.virtual_memory().available
     
-    # 计算最优batch size
+    # 计算最优batch size，从flags获取max_memory_usage
     optimal_batch_size = calculate_optimal_batch_size(
         input_size=input_size,
-        available_memory=available_memory
+        available_memory=available_memory,
+        max_memory_usage=_MAX_MEMORY_USAGE.value
     )
     
     print(f"Input size: {input_size}")
