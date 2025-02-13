@@ -741,6 +741,7 @@ def predict_structure_for_large_input(
     model_config: model.Model.Config,
     model_dir: pathlib.Path,
     fold_input: folding_input.Input,
+    max_memory_usage: float,  # 从外部传入参数
 ) -> ResultsForSeed:
     """处理大型输入的预测，添加资源监控"""
     
@@ -750,11 +751,11 @@ def predict_structure_for_large_input(
     # 获取系统可用内存
     available_memory = psutil.virtual_memory().available
     
-    # 计算最优batch size，从flags获取max_memory_usage
+    # 计算最优batch size
     optimal_batch_size = calculate_optimal_batch_size(
         input_size=input_size,
         available_memory=available_memory,
-        max_memory_usage=_MAX_MEMORY_USAGE.value
+        max_memory_usage=max_memory_usage  # 使用传入的参数
     )
     
     print(f"Input size: {input_size}")
@@ -829,8 +830,8 @@ def predict_structure_for_large_input(
                 print(f'Processing batch {batch_idx + 1}/{len(batches)}...')
                 batch_start_time = time.time()
                 
-                # 等待内存可用
-                while psutil.virtual_memory().percent > _MAX_MEMORY_USAGE.value * 100:
+                # 修改内存检查部分
+                while psutil.virtual_memory().percent > (max_memory_usage * 100):
                     print("Waiting for memory to be available...")
                     time.sleep(10)
                     gc.collect()
@@ -913,9 +914,10 @@ def worker_process(
     result_queue: multiprocessing.Queue,
     model_config: model.Model.Config,
     model_dir: pathlib.Path,
+    max_memory_usage: float,  # 添加参数
     max_retries: int = 3,
 ):
-    """工作进程处理函数，基于资源监控进行重试"""
+    """工作进程处理函数"""
     try:
         while True:
             try:
@@ -934,6 +936,7 @@ def worker_process(
                             model_config=model_config,
                             model_dir=model_dir,
                             fold_input=fold_input,
+                            max_memory_usage=max_memory_usage  # 传递参数
                         )
                         result_queue.put((seed, result))
                         break
@@ -960,7 +963,10 @@ def predict_structure(
     buckets: Sequence[int] | None = None,
     conformer_max_iterations: int | None = None,
 ) -> Sequence[ResultsForSeed]:
-    """并行运行推理管道来预测每个seed的结构，添加动态负载均衡"""
+    """并行运行推理管道来预测每个seed的结构"""
+    
+    # 在这里获取flag值
+    max_memory_usage = _MAX_MEMORY_USAGE.value
     
     with memory_tracker("Data Featurisation"):
         print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
@@ -1010,7 +1016,13 @@ def predict_structure(
     for _ in range(num_workers):
         p = multiprocessing.Process(
             target=worker_process,
-            args=(task_queue, result_queue, model_config, model_dir)
+            args=(
+                task_queue, 
+                result_queue, 
+                model_config, 
+                model_dir,
+                max_memory_usage  # 传递参数
+            )
         )
         p.start()
         processes.append(p)
