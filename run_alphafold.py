@@ -1064,67 +1064,102 @@ def process_fold_input_parallel(
     output_dir: str,
     buckets: Sequence[int] | None = None,
     conformer_max_iterations: int | None = None,
-    max_workers: int = 80,  # 默认使用80个核心
+    max_workers: int = 80,
 ) -> None:
     """并行处理多个fold inputs"""
     
-    # 计算最佳进程数
-    total_tasks = len(fold_inputs)
-    cpu_count = multiprocessing.cpu_count()
-    available_memory = psutil.virtual_memory().available
-    memory_per_process = 4 * 1024 * 1024 * 1024  # 估计每个进程4GB内存
+    # 检查是否是分割后的输入
+    is_split_input = any('_part' in input.name for input in fold_inputs)
     
-    # 基于CPU核心数和内存限制计算最大进程数
-    max_processes_by_cpu = min(cpu_count - 1, max_workers)
-    max_processes_by_memory = max(1, available_memory // memory_per_process)
-    num_workers = min(max_processes_by_cpu, max_processes_by_memory, total_tasks)
+    # 如果是分割后的输入，固定使用2个进程
+    if is_split_input:
+        num_workers = 2
+        print("\n=== Using 2 parallel processes for split inputs ===")
+    else:
+        # 计算最佳进程数
+        total_tasks = len(fold_inputs)
+        cpu_count = multiprocessing.cpu_count()
+        available_memory = psutil.virtual_memory().available
+        memory_per_process = 4 * 1024 * 1024 * 1024  # 估计每个进程4GB内存
+        
+        # 基于CPU核心数和内存限制计算最大进程数
+        max_processes_by_cpu = min(cpu_count - 1, max_workers)
+        max_processes_by_memory = max(1, available_memory // memory_per_process)
+        num_workers = min(max_processes_by_cpu, max_processes_by_memory, total_tasks)
     
-    print(f"\nSystem resources:")
-    print(f"Total CPU cores: {cpu_count}")
-    print(f"Available memory: {available_memory / (1024**3):.1f} GB")
-    print(f"Estimated memory per process: {memory_per_process / (1024**3):.1f} GB")
-    print(f"Maximum processes by CPU: {max_processes_by_cpu}")
-    print(f"Maximum processes by memory: {max_processes_by_memory}")
-    print(f"Final number of workers: {num_workers}")
+    print(f"\nParallel Processing Configuration:")
+    print(f"Input type: {'Split inputs' if is_split_input else 'Original inputs'}")
+    print(f"Total tasks: {len(fold_inputs)}")
+    print(f"Number of workers: {num_workers}")
+    if not is_split_input:
+        print(f"Total CPU cores: {multiprocessing.cpu_count()}")
+        print(f"Available memory: {psutil.virtual_memory().available / (1024**3):.1f} GB")
+    
+    # 如果是分割后的输入，将任务分成两组
+    if is_split_input:
+        half = len(fold_inputs) // 2
+        first_half = fold_inputs[:half]
+        second_half = fold_inputs[half:]
+        print(f"\nSplit task distribution:")
+        print(f"Process 1: {len(first_half)} tasks")
+        print(f"Process 2: {len(second_half)} tasks")
     
     # 创建进程池
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
         # 提交所有任务
         futures = []
-        for fold_input in fold_inputs:
-            future = executor.submit(
-                process_fold_input,
-                fold_input=fold_input,
-                data_pipeline_config=data_pipeline_config,
-                model_config=model_config,
-                model_dir=model_dir,
-                output_dir=os.path.join(output_dir, fold_input.sanitised_name()),
-                buckets=buckets,
-                conformer_max_iterations=conformer_max_iterations,
-            )
-            futures.append((fold_input.name, future))
-            print(f"Submitted task for {fold_input.name}")
         
-        # 等待所有任务完成，添加进度跟踪
-        completed = 0
+        if is_split_input:
+            # 为两个进程分别提交任务
+            for i, batch in enumerate([first_half, second_half], 1):
+                for fold_input in batch:
+                    future = executor.submit(
+                        process_fold_input,
+                        fold_input=fold_input,
+                        data_pipeline_config=data_pipeline_config,
+                        model_config=model_config,
+                        model_dir=model_dir,
+                        output_dir=os.path.join(output_dir, fold_input.sanitised_name()),
+                        buckets=buckets,
+                        conformer_max_iterations=conformer_max_iterations,
+                    )
+                    futures.append((fold_input.name, future, i))
+                    print(f"Submitted task for {fold_input.name} to process {i}")
+        else:
+            # 原始的任务提交方式
+            for fold_input in fold_inputs:
+                future = executor.submit(
+                    process_fold_input,
+                    fold_input=fold_input,
+                    data_pipeline_config=data_pipeline_config,
+                    model_config=model_config,
+                    model_dir=model_dir,
+                    output_dir=os.path.join(output_dir, fold_input.sanitised_name()),
+                    buckets=buckets,
+                    conformer_max_iterations=conformer_max_iterations,
+                )
+                futures.append((fold_input.name, future, 0))
+                print(f"Submitted task for {fold_input.name}")
+        
+        # 等待所有任务完成
+        completed = {1: 0, 2: 0} if is_split_input else {0: 0}
         total = len(futures)
         start_time = time.time()
         
-        for name, future in futures:
+        for name, future, process_id in futures:
             try:
                 future.result()
-                completed += 1
-                elapsed = time.time() - start_time
-                avg_time = elapsed / completed if completed > 0 else 0
-                remaining = total - completed
-                eta = avg_time * remaining if avg_time > 0 else 0
+                completed[process_id] += 1
                 
-                print(f"\nProgress: {completed}/{total} ({completed/total*100:.1f}%)")
+                # 打印进度
+                if is_split_input:
+                    print(f"\nProcess {process_id} progress: {completed[process_id]}/{len(first_half if process_id==1 else second_half)}")
+                else:
+                    print(f"\nProgress: {completed[0]}/{total}")
+                
                 print(f"Completed: {name}")
-                print(f"Average time per task: {avg_time:.1f} seconds")
-                print(f"Estimated time remaining: {eta/60:.1f} minutes")
                 
-                # 打印当前系统资源使用情况
+                # 打印资源使用情况
                 cpu_percent = psutil.cpu_percent(interval=1)
                 mem = psutil.virtual_memory()
                 print(f"CPU Usage: {cpu_percent}%")
@@ -1132,7 +1167,7 @@ def process_fold_input_parallel(
                 
             except Exception as e:
                 print(f"Error processing {name}: {e}")
-                raise  # 在开发阶段，让错误可见
+                raise
 
 def main(_):
   if _JAX_COMPILATION_CACHE_DIR.value is not None:
