@@ -1053,11 +1053,15 @@ def split_fold_input(fold_input: folding_input.Input, max_tokens: int = 1000) ->
     """将大型输入分割成多个小份"""
     total_tokens = sum(len(chain.sequence) for chain in fold_input.chains)
     if total_tokens <= max_tokens:
+        print(f"\nInput {fold_input.name} has {total_tokens} tokens, no splitting needed")
         return [fold_input]
     
     # 计算需要分成几份
     num_splits = (total_tokens + max_tokens - 1) // max_tokens
-    print(f"Input size {total_tokens} tokens exceeds {max_tokens}, splitting into {num_splits} parts")
+    print(f"\n=== Splitting input {fold_input.name} ===")
+    print(f"Total tokens: {total_tokens}")
+    print(f"Max tokens per split: {max_tokens}")
+    print(f"Number of splits needed: {num_splits}")
     
     # 分割chains
     splits = []
@@ -1067,13 +1071,15 @@ def split_fold_input(fold_input: folding_input.Input, max_tokens: int = 1000) ->
     for chain in fold_input.chains:
         chain_tokens = len(chain.sequence)
         if current_tokens + chain_tokens > max_tokens and current_chains:
-            # 创建新的fold_input，只传递必要的参数
+            # 创建新的fold_input
+            split_name = f"{fold_input.name}_part{len(splits)+1}"
             split_input = folding_input.Input(
-                name=f"{fold_input.name}_part{len(splits)}",
+                name=split_name,
                 chains=current_chains.copy(),
                 rng_seeds=fold_input.rng_seeds,
                 user_ccd=fold_input.user_ccd if hasattr(fold_input, 'user_ccd') else None,
             )
+            print(f"Created split {split_name} with {current_tokens} tokens")
             splits.append(split_input)
             current_chains = []
             current_tokens = 0
@@ -1083,14 +1089,17 @@ def split_fold_input(fold_input: folding_input.Input, max_tokens: int = 1000) ->
     
     # 添加最后一部分
     if current_chains:
+        split_name = f"{fold_input.name}_part{len(splits)+1}"
         split_input = folding_input.Input(
-            name=f"{fold_input.name}_part{len(splits)}",
+            name=split_name,
             chains=current_chains,
             rng_seeds=fold_input.rng_seeds,
             user_ccd=fold_input.user_ccd if hasattr(fold_input, 'user_ccd') else None,
         )
+        print(f"Created split {split_name} with {current_tokens} tokens")
         splits.append(split_input)
     
+    print(f"=== Split complete: {len(splits)} parts created ===\n")
     return splits
 
 def process_fold_input_parallel(
@@ -1105,8 +1114,27 @@ def process_fold_input_parallel(
 ) -> None:
     """并行处理多个fold inputs"""
     
+    # 计算最佳进程数
+    total_tasks = len(fold_inputs)
+    cpu_count = multiprocessing.cpu_count()
+    available_memory = psutil.virtual_memory().available
+    memory_per_process = 4 * 1024 * 1024 * 1024  # 估计每个进程4GB内存
+    
+    # 基于CPU核心数和内存限制计算最大进程数
+    max_processes_by_cpu = min(cpu_count - 1, max_workers)
+    max_processes_by_memory = max(1, available_memory // memory_per_process)
+    num_workers = min(max_processes_by_cpu, max_processes_by_memory, total_tasks)
+    
+    print(f"\nSystem resources:")
+    print(f"Total CPU cores: {cpu_count}")
+    print(f"Available memory: {available_memory / (1024**3):.1f} GB")
+    print(f"Estimated memory per process: {memory_per_process / (1024**3):.1f} GB")
+    print(f"Maximum processes by CPU: {max_processes_by_cpu}")
+    print(f"Maximum processes by memory: {max_processes_by_memory}")
+    print(f"Final number of workers: {num_workers}")
+    
     # 创建进程池
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
         # 提交所有任务
         futures = []
         for fold_input in fold_inputs:
@@ -1121,14 +1149,36 @@ def process_fold_input_parallel(
                 conformer_max_iterations=conformer_max_iterations,
             )
             futures.append((fold_input.name, future))
+            print(f"Submitted task for {fold_input.name}")
         
-        # 等待所有任务完成
+        # 等待所有任务完成，添加进度跟踪
+        completed = 0
+        total = len(futures)
+        start_time = time.time()
+        
         for name, future in futures:
             try:
                 future.result()
-                print(f"Completed processing {name}")
+                completed += 1
+                elapsed = time.time() - start_time
+                avg_time = elapsed / completed if completed > 0 else 0
+                remaining = total - completed
+                eta = avg_time * remaining if avg_time > 0 else 0
+                
+                print(f"\nProgress: {completed}/{total} ({completed/total*100:.1f}%)")
+                print(f"Completed: {name}")
+                print(f"Average time per task: {avg_time:.1f} seconds")
+                print(f"Estimated time remaining: {eta/60:.1f} minutes")
+                
+                # 打印当前系统资源使用情况
+                cpu_percent = psutil.cpu_percent(interval=1)
+                mem = psutil.virtual_memory()
+                print(f"CPU Usage: {cpu_percent}%")
+                print(f"Memory Usage: {mem.percent}%")
+                
             except Exception as e:
                 print(f"Error processing {name}: {e}")
+                raise  # 在开发阶段，让错误可见
 
 def main(_):
   if _JAX_COMPILATION_CACHE_DIR.value is not None:
@@ -1227,6 +1277,11 @@ def main(_):
 
   # 在处理fold_inputs之前添加分割逻辑
   all_split_inputs = []
+  total_original_inputs = len(fold_inputs)
+  
+  print("\n=== Starting input processing and splitting ===")
+  print(f"Number of original inputs: {total_original_inputs}")
+  
   for fold_input in fold_inputs:
       if _NUM_SEEDS.value is not None:
           print(f'Expanding fold job {fold_input.name} to {_NUM_SEEDS.value} seeds')
@@ -1237,8 +1292,14 @@ def main(_):
       all_split_inputs.extend(split_inputs)
   
   # 使用并行处理
-  num_workers = min(80, len(all_split_inputs))  # 最多使用80个核心
-  print(f"Processing {len(all_split_inputs)} fold inputs using {num_workers} workers")
+  print("\n=== Parallel processing summary ===")
+  print(f"Original inputs: {total_original_inputs}")
+  print(f"After splitting: {len(all_split_inputs)} parts")
+  print(f"Parallel jobs to run: {len(all_split_inputs)}")
+  print("\nSystem information:")
+  print(f"CPU cores available: {multiprocessing.cpu_count()}")
+  print(f"Memory available: {psutil.virtual_memory().available / (1024**3):.1f} GB")
+  print("===================================\n")
   
   process_fold_input_parallel(
       fold_inputs=all_split_inputs,
@@ -1248,7 +1309,7 @@ def main(_):
       output_dir=_OUTPUT_DIR.value,
       buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
       conformer_max_iterations=_CONFORMER_MAX_ITERATIONS.value,
-      max_workers=num_workers,
+      max_workers=80,
   )
 
   print(f'Done running {len(all_split_inputs)} fold jobs.')
