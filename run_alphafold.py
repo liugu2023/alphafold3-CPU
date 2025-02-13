@@ -939,20 +939,34 @@ def calculate_optimal_workers(
     memory_per_process: int = 4 * 1024 * 1024 * 1024,  # 4GB per process
 ) -> int:
     """计算最优的工作进程数"""
-    cpu_count = multiprocessing.cpu_count()
-    available_memory = psutil.virtual_memory().available
+    # 获取可用的CPU核心数
+    cpu_info = get_cpu_info()
+    available_cpus = cpu_info['available_cpus']
     
-    # 基于内存计算可用进程数
+    # 强制使用至少60个核心
+    if available_cpus < min_workers:
+        print(f"\nWarning: System reports only {available_cpus} CPUs")
+        print(f"Attempting to force use of {min_workers} cores")
+        available_cpus = set_cpu_affinity(min_cores=min_workers, max_cores=max_workers)
+    
+    # 计算可用的工作进程数
+    available_memory = psutil.virtual_memory().available
     max_processes_by_memory = max(1, available_memory // memory_per_process)
     
     # 确保进程数在60-80之间
-    num_workers = min(max_workers, max(min_workers, cpu_count - 1))
+    num_workers = min(max_workers, max(min_workers, available_cpus))
     
     # 考虑内存限制
     num_workers = min(num_workers, max_processes_by_memory)
     
     # 不要超过实际任务数
     num_workers = min(num_workers, total_tasks)
+    
+    print("\n=== Worker Configuration ===")
+    print(f"Available CPU cores: {available_cpus}")
+    print(f"Memory-based limit: {max_processes_by_memory}")
+    print(f"Selected workers: {num_workers}")
+    print(f"Force using range: {min_workers}-{max_workers}")
     
     return num_workers
 
@@ -1135,8 +1149,94 @@ def split_fold_input(fold_input: folding_input.Input, max_tokens: int = 500) -> 
     
     return splits
 
+def get_cpu_info():
+    """获取CPU配置信息"""
+    try:
+        import psutil
+        cpu_count = psutil.cpu_count(logical=True)  # 总线程数
+        physical_count = psutil.cpu_count(logical=False)  # 物理核心数
+        
+        # 获取CPU使用策略
+        cpu_affinity = len(psutil.Process().cpu_affinity())
+        
+        return {
+            'total_cpus': cpu_count,
+            'physical_cores': physical_count,
+            'available_cpus': cpu_affinity,
+            'numa_nodes': len(set(psutil.Process().cpu_affinity())) // physical_count
+        }
+    except Exception as e:
+        print(f"Warning: Could not get detailed CPU info: {e}")
+        return {
+            'total_cpus': multiprocessing.cpu_count(),
+            'physical_cores': multiprocessing.cpu_count(),
+            'available_cpus': multiprocessing.cpu_count(),
+            'numa_nodes': 1
+        }
+
+def set_cpu_affinity(min_cores=60, max_cores=80):
+    """设置进程的CPU亲和性"""
+    try:
+        process = psutil.Process()
+        all_cpus = list(range(psutil.cpu_count()))
+        
+        # 确保至少使用min_cores个核心
+        num_cores = min(max_cores, max(min_cores, len(all_cpus)))
+        
+        # 设置CPU亲和性
+        process.cpu_affinity(all_cpus[:num_cores])
+        print(f"Set CPU affinity to use {num_cores} cores: {process.cpu_affinity()}")
+        return num_cores
+    except Exception as e:
+        print(f"Warning: Could not set CPU affinity: {e}")
+        return multiprocessing.cpu_count()
+
+def check_system_limits():
+    """检查系统资源限制"""
+    try:
+        import resource
+        # 获取进程数限制
+        soft, hard = resource.getrlimit(resource.RLIMIT_NPROC)
+        print(f"\nProcess limit (soft/hard): {soft}/{hard}")
+        
+        # 获取CPU时间限制
+        soft, hard = resource.getrlimit(resource.RLIMIT_CPU)
+        print(f"CPU time limit (soft/hard): {soft}/{hard}")
+        
+        # 检查cgroup限制
+        try:
+            with open('/sys/fs/cgroup/cpu/cpu.cfs_quota_us') as f:
+                quota = int(f.read())
+            with open('/sys/fs/cgroup/cpu/cpu.cfs_period_us') as f:
+                period = int(f.read())
+            if quota > 0:
+                cgroup_cpus = quota / period
+                print(f"CGroup CPU limit: {cgroup_cpus}")
+        except:
+            pass
+            
+    except Exception as e:
+        print(f"Warning: Could not check system limits: {e}")
+
 def main(_):
     try:
+        # 获取并打印CPU信息
+        cpu_info = get_cpu_info()
+        print("\n=== CPU Configuration ===")
+        print(f"Total CPU threads: {cpu_info['total_cpus']}")
+        print(f"Physical cores: {cpu_info['physical_cores']}")
+        print(f"Available CPUs: {cpu_info['available_cpus']}")
+        print(f"NUMA nodes: {cpu_info['numa_nodes']}")
+        
+        # 设置CPU亲和性
+        num_cores = set_cpu_affinity(min_cores=60, max_cores=80)
+        print(f"\nConfigured to use {num_cores} CPU cores")
+        
+        # 设置线程数环境变量
+        os.environ['MKL_NUM_THREADS'] = str(num_cores)
+        os.environ['OMP_NUM_THREADS'] = str(num_cores)
+        os.environ['OPENBLAS_NUM_THREADS'] = str(num_cores)
+        
         if _JAX_COMPILATION_CACHE_DIR.value is not None:
             jax.config.update(
                 'jax_compilation_cache_dir', _JAX_COMPILATION_CACHE_DIR.value
