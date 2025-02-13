@@ -19,6 +19,20 @@ if received directly from Google. Use is subject to terms of use available at
 https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md
 """
 
+import os
+# 禁用ROCM和TPU检测
+os.environ['JAX_PLATFORMS'] = 'cpu'  # 只使用CPU
+os.environ['JAX_PLATFORM_NAME'] = 'cpu'
+os.environ['CUDA_VISIBLE_DEVICES'] = ''  # 禁用CUDA
+os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=1'  # 强制使用CPU
+
+# 设置CPU优化参数
+os.environ['MKL_NUM_THREADS'] = str(multiprocessing.cpu_count())
+os.environ['OMP_NUM_THREADS'] = str(multiprocessing.cpu_count())
+os.environ['OPENBLAS_NUM_THREADS'] = str(multiprocessing.cpu_count())
+os.environ['MKL_DEBUG_CPU_TYPE'] = '5'
+os.environ['MKL_ENABLE_INSTRUCTIONS'] = 'AVX2'
+
 from collections.abc import Callable, Sequence
 import csv
 import dataclasses
@@ -219,11 +233,6 @@ _JAX_COMPILATION_CACHE_DIR = flags.DEFINE_string(
     None,
     'Path to a directory for the JAX compilation cache.',
 )
-_GPU_DEVICE = flags.DEFINE_integer(
-    'gpu_device',
-    None,  # 改为None默认值
-    'Deprecated: GPU device selection is not supported in CPU-only mode.',
-)
 _BUCKETS = flags.DEFINE_list(
     'buckets',
     # pyformat: disable
@@ -233,19 +242,6 @@ _BUCKETS = flags.DEFINE_list(
     'Strictly increasing order of token sizes for which to cache compilations.'
     ' For any input with more tokens than the largest bucket size, a new bucket'
     ' is created for exactly that number of tokens.',
-)
-_FLASH_ATTENTION_IMPLEMENTATION = flags.DEFINE_enum(
-    'flash_attention_implementation',
-    default='triton',
-    enum_values=['triton', 'cudnn', 'xla'],
-    help=(
-        "Flash attention implementation to use. 'triton' and 'cudnn' uses a"
-        ' Triton and cuDNN flash attention implementation, respectively. The'
-        ' Triton kernel is fastest and has been tested more thoroughly. The'
-        " Triton and cuDNN kernels require Ampere GPUs or later. 'xla' uses an"
-        ' XLA attention implementation (no flash attention) and is portable'
-        ' across GPU devices.'
-    ),
 )
 _NUM_RECYCLES = flags.DEFINE_integer(
     'num_recycles',
@@ -1072,13 +1068,12 @@ def split_fold_input(fold_input: folding_input.Input, max_tokens: int = 1000) ->
     for chain in fold_input.chains:
         chain_tokens = len(chain.sequence)
         if current_tokens + chain_tokens > max_tokens and current_chains:
-            # 创建新的fold_input
+            # 创建新的fold_input，只传递必要的参数
             split_input = folding_input.Input(
                 name=f"{fold_input.name}_part{len(splits)}",
                 chains=current_chains.copy(),
                 rng_seeds=fold_input.rng_seeds,
-                templates=fold_input.templates,
-                user_ccd=fold_input.user_ccd,
+                user_ccd=fold_input.user_ccd if hasattr(fold_input, 'user_ccd') else None,
             )
             splits.append(split_input)
             current_chains = []
@@ -1093,8 +1088,7 @@ def split_fold_input(fold_input: folding_input.Input, max_tokens: int = 1000) ->
             name=f"{fold_input.name}_part{len(splits)}",
             chains=current_chains,
             rng_seeds=fold_input.rng_seeds,
-            templates=fold_input.templates,
-            user_ccd=fold_input.user_ccd,
+            user_ccd=fold_input.user_ccd if hasattr(fold_input, 'user_ccd') else None,
         )
         splits.append(split_input)
     
