@@ -1198,13 +1198,13 @@ def main(_):
     )
 
   if _INPUT_DIR.value is not None:
-    fold_inputs = folding_input.load_fold_inputs_from_dir(
+    fold_inputs = list(folding_input.load_fold_inputs_from_dir(
         pathlib.Path(_INPUT_DIR.value)
-    )
+    ))
   elif _JSON_PATH.value is not None:
-    fold_inputs = folding_input.load_fold_inputs_from_path(
+    fold_inputs = list(folding_input.load_fold_inputs_from_path(
         pathlib.Path(_JSON_PATH.value)
-    )
+    ))
   else:
     raise AssertionError(
         'Exactly one of --json_path or --input_dir must be specified.'
