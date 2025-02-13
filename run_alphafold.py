@@ -737,7 +737,7 @@ def predict_structure(
     buckets: Sequence[int] | None = None,
     conformer_max_iterations: int | None = None,
 ) -> Sequence[ResultsForSeed]:
-    """并行运行推理管道来预测每个seed的结构，添加动态负载均衡"""
+    """并行运行推理管道来预测每个seed的结构"""
     
     with memory_tracker("Data Featurisation"):
         print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
@@ -755,110 +755,64 @@ def predict_structure(
             f' {time.time() - featurisation_start_time:.2f} seconds.'
         )
     
-    # 根据系统资源动态调整进程数
+    # 计算最佳进程数
+    total_tasks = len(fold_input.rng_seeds)
+    cpu_count = multiprocessing.cpu_count()
     available_memory = psutil.virtual_memory().available
-    memory_per_process = 2 * 1024 * 1024 * 1024  # 估计每个进程2GB内存
+    memory_per_process = 4 * 1024 * 1024 * 1024  # 估计每个进程4GB内存
+    
+    max_processes_by_cpu = min(cpu_count - 1, 80)  # 最多使用80个核心
     max_processes_by_memory = max(1, available_memory // memory_per_process)
+    num_workers = min(max_processes_by_cpu, max_processes_by_memory, total_tasks)
     
-    num_cpus = multiprocessing.cpu_count()
-    num_workers = min(
-        len(fold_input.rng_seeds),
-        max(1, num_cpus - 1),
-        max_processes_by_memory
-    )
+    print(f"\n=== Model Inference Parallelization ===")
+    print(f"Number of seeds to process: {total_tasks}")
+    print(f"Number of parallel workers: {num_workers}")
     
-    print(
-        f'Running parallel model inference with {num_workers} workers for'
-        f' {len(fold_input.rng_seeds)} seed(s)...'
-    )
-    print(f'Available memory: {available_memory / 1024 / 1024:.2f} MB')
-    print(f'Estimated memory per process: {memory_per_process / 1024 / 1024:.2f} MB')
+    all_inference_start_time = time.time()
     
-    # 创建任务队列和结果队列
-    task_queue = multiprocessing.Queue()
-    result_queue = multiprocessing.Queue()
-    
-    # 将任务放入队列
-    for seed, example in zip(fold_input.rng_seeds, featurised_examples):
-        task_queue.put((seed, example, fold_input))
-    
-    # 创建并启动工作进程
-    processes = []
-    for _ in range(num_workers):
-        p = multiprocessing.Process(
-            target=worker_process,
-            args=(task_queue, result_queue, model_config, model_dir)
-        )
-        p.start()
-        processes.append(p)
-    
-    # 收集结果
-    all_inference_results = []
-    completed_seeds = set()
-    total_seeds = len(fold_input.rng_seeds)
-    
-    start_time = time.time()
-    last_progress_time = start_time
-    
-    try:
-        while len(completed_seeds) < total_seeds:
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = []
+        for seed, example in zip(fold_input.rng_seeds, featurised_examples):
+            future = executor.submit(
+                predict_structure_for_seed,
+                seed=seed,
+                featurised_example=example,
+                model_config=model_config,
+                model_dir=model_dir,
+                fold_input=fold_input,
+            )
+            futures.append((seed, future))
+            print(f"Submitted inference task for seed {seed}")
+        
+        # 收集结果
+        all_inference_results = []
+        completed = 0
+        
+        for seed, future in futures:
             try:
-                seed, result = result_queue.get(timeout=300)  # 5分钟超时
-                
-                if isinstance(result, Exception):
-                    print(f"Error processing seed {seed}: {result}")
-                    continue
-                
+                result = future.result()
                 all_inference_results.append(result)
-                completed_seeds.add(seed)
+                completed += 1
                 
-                # 每30秒打印一次进度
-                current_time = time.time()
-                if current_time - last_progress_time > 30:
-                    elapsed = current_time - start_time
-                    completed = len(completed_seeds)
-                    remaining = total_seeds - completed
-                    rate = completed / elapsed if elapsed > 0 else 0
-                    eta = remaining / rate if rate > 0 else 0
-                    
-                    print(f"Progress: {completed}/{total_seeds} seeds completed")
-                    print(f"Rate: {rate:.2f} seeds/second")
-                    print(f"ETA: {eta/60:.1f} minutes")
-                    
-                    last_progress_time = current_time
+                # 打印进度
+                print(f"\nProgress: {completed}/{total_tasks} seeds completed")
+                print(f"Completed seed: {seed}")
                 
-            except queue.Empty:
-                print("Warning: No results received for 5 minutes")
+                # 打印资源使用情况
+                cpu_percent = psutil.cpu_percent(interval=1)
+                mem = psutil.virtual_memory()
+                print(f"CPU Usage: {cpu_percent}%")
+                print(f"Memory Usage: {mem.percent}%")
                 
-    except KeyboardInterrupt:
-        print("\nInterrupted by user. Cleaning up...")
-        for p in processes:
-            p.terminate()
-    finally:
-        # 等待所有进程完成
-        for p in processes:
-            p.join()
-        
-        # 清理队列
-        while not task_queue.empty():
-            try:
-                task_queue.get_nowait()
-            except queue.Empty:
-                break
-        
-        while not result_queue.empty():
-            try:
-                result_queue.get_nowait()
-            except queue.Empty:
-                break
-    
-    # 按seed排序结果
-    all_inference_results.sort(key=lambda x: x.seed)
+            except Exception as e:
+                print(f"Error processing seed {seed}: {e}")
+                raise
     
     print(
         'Running parallel model inference and extracting output structures with'
         f' {len(fold_input.rng_seeds)} seed(s) took'
-        f' {time.time() - start_time:.2f} seconds.'
+        f' {time.time() - all_inference_start_time:.2f} seconds.'
     )
     
     return all_inference_results
@@ -1287,8 +1241,8 @@ def main(_):
           print(f'Expanding fold job {fold_input.name} to {_NUM_SEEDS.value} seeds')
           fold_input = fold_input.with_multiple_seeds(_NUM_SEEDS.value)
       
-      # 分割大型输入
-      split_inputs = split_fold_input(fold_input, max_tokens=1000)
+      # 分割大型输入，使用500作为阈值
+      split_inputs = split_fold_input(fold_input, max_tokens=500)  # 降低到500
       all_split_inputs.extend(split_inputs)
   
   # 使用并行处理
