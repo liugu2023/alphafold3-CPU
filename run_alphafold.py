@@ -21,8 +21,6 @@ https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md
 
 import os
 import multiprocessing
-import signal
-import sys
 # 禁用ROCM和TPU检测
 os.environ['JAX_PLATFORMS'] = 'cpu'  # 只使用CPU
 os.environ['JAX_PLATFORM_NAME'] = 'cpu'
@@ -47,7 +45,7 @@ import string
 import textwrap
 import time
 import typing
-from typing import Dict, Any, Tuple, Optional, Sequence
+from typing import overload, Dict, Any, Tuple, Optional
 from concurrent.futures import ProcessPoolExecutor
 import psutil
 import gc
@@ -627,21 +625,6 @@ def memory_tracker(operation_name: str):
         print(f"Time: {end_time - start_time:.2f} seconds")
 
 
-def cleanup_process_memory():
-    """清理进程的内存"""
-    gc.collect()  # 触发垃圾回收
-    
-    if hasattr(jax, 'clear_caches'):  # 清理JAX缓存
-        jax.clear_caches()
-    
-    # 尝试释放未使用的内存回操作系统
-    try:
-        import ctypes
-        libc = ctypes.CDLL('libc.so.6')
-        libc.malloc_trim(0)
-    except:
-        pass  # 如果失败就忽略
-
 def predict_structure_for_seed(
     seed: int,
     featurised_example: features.BatchDict,
@@ -649,58 +632,63 @@ def predict_structure_for_seed(
     model_dir: pathlib.Path,
     fold_input: folding_input.Input,
 ) -> ResultsForSeed:
-    """处理单个seed的预测"""
-    try:
-        with memory_tracker("Model Runner Creation"):
-            model_runner = create_model_runner(model_config, model_dir)
+    """处理单个seed的预测，添加缓存优化"""
+    
+    with memory_tracker("Model Runner Creation"):
+        model_runner = create_model_runner(model_config, model_dir)
+    
+    # 清理不需要的缓存
+    gc.collect()
+    
+    with memory_tracker("Model Inference"):
+        print(f'Running model inference with seed {seed}...')
+        inference_start_time = time.time()
         
-        # 清理不需要的缓存
-        cleanup_process_memory()
+        # 使用确定性的随机数生成
+        rng_key = jax.random.PRNGKey(seed)
         
-        with memory_tracker("Model Inference"):
-            print(f'Running model inference with seed {seed}...')
-            inference_start_time = time.time()
-            rng_key = jax.random.PRNGKey(seed)
-            result = model_runner.run_inference(featurised_example, rng_key)
-            
-            print(
-                f'Running model inference with seed {seed} took'
-                f' {time.time() - inference_start_time:.2f} seconds.'
-            )
+        # 运行推理，使用缓存
+        result = model_runner.run_inference(featurised_example, rng_key)
         
-        # 提取需要的数据后释放大型中间结果
-        with memory_tracker("Structure Extraction"):
-            print(f'Extracting output structure samples with seed {seed}...')
-            extract_structures = time.time()
-            inference_results = model_runner.extract_structures(
-                batch=featurised_example, 
-                result=result,
-                target_name=fold_input.name
-            )
-            
-            embeddings = model_runner.extract_embeddings(result)
-            
-            print(
-                f'Extracting {len(inference_results)} output structure samples with'
-                f' seed {seed} took {time.time() - extract_structures:.2f} seconds.'
-            )
+        # 打印缓存统计
+        hits, misses = model_runner._cache_manager.get_stats()
+        print(f"Cache stats - hits: {hits}, misses: {misses}")
         
-        # 主动释放大型对象
-        del result
-        del model_runner
-        del featurised_example
-        cleanup_process_memory()
-        
-        return ResultsForSeed(
-            seed=seed,
-            inference_results=inference_results,
-            full_fold_input=fold_input,
-            embeddings=embeddings,
+        print(
+            f'Running model inference with seed {seed} took'
+            f' {time.time() - inference_start_time:.2f} seconds.'
         )
     
-    finally:
-        # 确保在任何情况下都清理内存
-        cleanup_process_memory()
+    # 提取需要的数据后释放大型中间结果
+    with memory_tracker("Structure Extraction"):
+        print(f'Extracting output structure samples with seed {seed}...')
+        extract_structures = time.time()
+        
+        # 使用优化后的结构提取
+        inference_results = model_runner.extract_structures(
+            batch=featurised_example, 
+            result=result,
+            target_name=fold_input.name
+        )
+        
+        print(
+            f'Extracting {len(inference_results)} output structure samples with'
+            f' seed {seed} took {time.time() - extract_structures:.2f} seconds.'
+        )
+        
+        embeddings = model_runner.extract_embeddings(result)
+        
+        # 释放大型中间结果
+        del result
+        del model_runner
+        gc.collect()
+    
+    return ResultsForSeed(
+        seed=seed,
+        inference_results=inference_results,
+        full_fold_input=fold_input,
+        embeddings=embeddings,
+    )
 
 
 def worker_process(
@@ -769,15 +757,17 @@ def predict_structure(
     
     # 计算最佳进程数
     total_tasks = len(fold_input.rng_seeds)
-    num_workers = calculate_optimal_workers(
-        total_tasks=total_tasks,
-        min_workers=60,
-        max_workers=80
-    )
+    cpu_count = multiprocessing.cpu_count()
+    available_memory = psutil.virtual_memory().available
+    memory_per_process = 4 * 1024 * 1024 * 1024  # 估计每个进程4GB内存
+    
+    max_processes_by_cpu = min(cpu_count - 1, 80)  # 最多使用80个核心
+    max_processes_by_memory = max(1, available_memory // memory_per_process)
+    num_workers = min(max_processes_by_cpu, max_processes_by_memory, total_tasks)
     
     print(f"\n=== Model Inference Parallelization ===")
     print(f"Number of seeds to process: {total_tasks}")
-    print(f"Using {num_workers} workers (range: 60-80)")
+    print(f"Number of parallel workers: {num_workers}")
     
     all_inference_start_time = time.time()
     
@@ -892,59 +882,129 @@ def write_outputs(
       writer.writerows(ranking_scores)
 
 
+@overload
 def process_fold_input(
     fold_input: folding_input.Input,
-    data_pipeline_config: Optional[pipeline.DataPipelineConfig],
-    model_config: Optional[model.Model.Config],
-    model_dir: Optional[pathlib.Path],
-    output_dir: str,
-    buckets: Optional[Sequence[int]] = None,
-    conformer_max_iterations: Optional[int] = None,
-) -> None:
-    """处理单个fold input的具体实现"""
-    # ... 原有的处理逻辑 ...
+    data_pipeline_config: pipeline.DataPipelineConfig | None,
+    model_config: None,
+    model_dir: None,
+    output_dir: os.PathLike[str] | str,
+    buckets: Sequence[int] | None = None,
+) -> folding_input.Input:
+    ...
 
-def process_fold_input_parallel(
-    fold_inputs: list[folding_input.Input],
-    data_pipeline_config: Optional[pipeline.DataPipelineConfig],
-    model_config: Optional[model.Model.Config],
-    model_dir: Optional[pathlib.Path],
-    output_dir: str,
-    buckets: Optional[Sequence[int]] = None,
-    conformer_max_iterations: Optional[int] = None,
-    max_workers: int = 80,
-    min_workers: int = 60,
-) -> None:
-    """并行处理多个fold inputs"""
-    try:
-        # ... 其余代码保持不变 ...
-        
-        # 创建进程池
-        with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            futures = []
-            for fold_input in fold_inputs:
-                # 确保传递正确的参数
-                future = executor.submit(
-                    process_fold_input,  # 使用非overload的实现
-                    fold_input=fold_input,
-                    data_pipeline_config=data_pipeline_config,
-                    model_config=model_config,
-                    model_dir=model_dir,
-                    output_dir=os.path.join(output_dir, fold_input.sanitised_name()),
-                    buckets=buckets,
-                    conformer_max_iterations=conformer_max_iterations,
-                )
-                futures.append((fold_input.name, future))
-                
-                if hasattr(future, '_process'):
-                    process_manager.processes.add(future._process.pid)
-                
-                print(f"Submitted task for {fold_input.name}")
-            
-            # ... 其余代码保持不变 ...
 
-def split_fold_input(fold_input: folding_input.Input, max_tokens: int = 500) -> list[folding_input.Input]:
-    """将大型输入分割成多个小份，每份不超过max_tokens个token"""
+@overload
+def process_fold_input(
+    fold_input: folding_input.Input,
+    data_pipeline_config: pipeline.DataPipelineConfig | None,
+    model_config: model.Model.Config,
+    model_dir: pathlib.Path,
+    output_dir: os.PathLike[str] | str,
+    buckets: Sequence[int] | None = None,
+) -> Sequence[ResultsForSeed]:
+    ...
+
+
+def replace_db_dir(path_with_db_dir: str, db_dirs: Sequence[str]) -> str:
+  """Replaces the DB_DIR placeholder in a path with the given DB_DIR."""
+  template = string.Template(path_with_db_dir)
+  if 'DB_DIR' in template.get_identifiers():
+    for db_dir in db_dirs:
+      path = template.substitute(DB_DIR=db_dir)
+      if os.path.exists(path):
+        return path
+    raise FileNotFoundError(
+        f'{path_with_db_dir} with ${{DB_DIR}} not found in any of {db_dirs}.'
+    )
+  if not os.path.exists(path_with_db_dir):
+    raise FileNotFoundError(f'{path_with_db_dir} does not exist.')
+  return path_with_db_dir
+
+
+def process_fold_input(
+    fold_input: folding_input.Input,
+    data_pipeline_config: pipeline.DataPipelineConfig | None,
+    model_config: model.Model.Config | None,
+    model_dir: pathlib.Path | None,
+    output_dir: os.PathLike[str] | str,
+    buckets: Sequence[int] | None = None,
+    conformer_max_iterations: int | None = None,
+) -> folding_input.Input | Sequence[ResultsForSeed]:
+    """Runs data pipeline and/or inference on a single fold input.
+
+    Args:
+        fold_input: Fold input to process.
+        data_pipeline_config: Data pipeline config to use. If None, skip the data
+            pipeline.
+        model_config: Model configuration to use. If None, skip inference.
+        model_dir: Path to model directory. Required if model_config is provided.
+        output_dir: Output directory to write to.
+        buckets: Bucket sizes to pad the data to, to avoid excessive re-compilation
+            of the model. If None, calculate the appropriate bucket size from the
+            number of tokens.
+        conformer_max_iterations: Optional override for maximum number of iterations
+            to run for RDKit conformer search.
+
+    Returns:
+        The processed fold input, or the inference results for each seed.
+
+    Raises:
+        ValueError: If the fold input has no chains.
+    """
+    print(f'\nRunning fold job {fold_input.name}...')
+
+    if not fold_input.chains:
+        raise ValueError('Fold input has no chains.')
+
+    if os.path.exists(output_dir) and os.listdir(output_dir):
+        new_output_dir = (
+            f'{output_dir}_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}'
+        )
+        print(
+            f'Output will be written in {new_output_dir} since {output_dir} is'
+            ' non-empty.'
+        )
+        output_dir = new_output_dir
+    else:
+        print(f'Output will be written in {output_dir}')
+
+    if data_pipeline_config is None:
+        print('Skipping data pipeline...')
+    else:
+        print('Running data pipeline...')
+        fold_input = pipeline.DataPipeline(data_pipeline_config).process(fold_input)
+
+    write_fold_input_json(fold_input, output_dir)
+    if model_config is None:
+        print('Skipping model inference...')
+        output = fold_input
+    else:
+        print(
+            f'Predicting 3D structure for {fold_input.name} with'
+            f' {len(fold_input.rng_seeds)} seed(s)...'
+        )
+        all_inference_results = predict_structure(
+            fold_input=fold_input,
+            model_config=model_config,
+            model_dir=model_dir,
+            buckets=buckets,
+            conformer_max_iterations=conformer_max_iterations,
+        )
+        print(f'Writing outputs with {len(fold_input.rng_seeds)} seed(s)...')
+        write_outputs(
+            all_inference_results=all_inference_results,
+            output_dir=output_dir,
+            job_name=fold_input.sanitised_name(),
+        )
+        output = all_inference_results
+
+    print(f'Fold job {fold_input.name} done, output written to {output_dir}\n')
+    return output
+
+
+def split_fold_input(fold_input: folding_input.Input, max_tokens: int = 1000) -> list[folding_input.Input]:
+    """将大型输入分割成多个小份"""
     total_tokens = sum(len(chain.sequence) for chain in fold_input.chains)
     if total_tokens <= max_tokens:
         print(f"\nInput {fold_input.name} has {total_tokens} tokens, no splitting needed")
@@ -994,246 +1054,221 @@ def split_fold_input(fold_input: folding_input.Input, max_tokens: int = 500) -> 
         splits.append(split_input)
     
     print(f"=== Split complete: {len(splits)} parts created ===\n")
-    
-    # 打印每个分割的详细信息
-    for split in splits:
-        split_tokens = sum(len(chain.sequence) for chain in split.chains)
-        print(f"Split {split.name}: {split_tokens} tokens, {len(split.chains)} chains")
-    
     return splits
 
-def get_cpu_info():
-    """获取CPU配置信息"""
-    try:
-        import psutil
-        cpu_count = psutil.cpu_count(logical=True)  # 总线程数
-        physical_count = psutil.cpu_count(logical=False)  # 物理核心数
+def process_fold_input_parallel(
+    fold_inputs: list[folding_input.Input],
+    data_pipeline_config: pipeline.DataPipelineConfig | None,
+    model_config: model.Model.Config | None,
+    model_dir: pathlib.Path | None,
+    output_dir: str,
+    buckets: Sequence[int] | None = None,
+    conformer_max_iterations: int | None = None,
+    max_workers: int = 80,  # 默认使用80个核心
+) -> None:
+    """并行处理多个fold inputs"""
+    
+    # 计算最佳进程数
+    total_tasks = len(fold_inputs)
+    cpu_count = multiprocessing.cpu_count()
+    available_memory = psutil.virtual_memory().available
+    memory_per_process = 4 * 1024 * 1024 * 1024  # 估计每个进程4GB内存
+    
+    # 基于CPU核心数和内存限制计算最大进程数
+    max_processes_by_cpu = min(cpu_count - 1, max_workers)
+    max_processes_by_memory = max(1, available_memory // memory_per_process)
+    num_workers = min(max_processes_by_cpu, max_processes_by_memory, total_tasks)
+    
+    print(f"\nSystem resources:")
+    print(f"Total CPU cores: {cpu_count}")
+    print(f"Available memory: {available_memory / (1024**3):.1f} GB")
+    print(f"Estimated memory per process: {memory_per_process / (1024**3):.1f} GB")
+    print(f"Maximum processes by CPU: {max_processes_by_cpu}")
+    print(f"Maximum processes by memory: {max_processes_by_memory}")
+    print(f"Final number of workers: {num_workers}")
+    
+    # 创建进程池
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        # 提交所有任务
+        futures = []
+        for fold_input in fold_inputs:
+            future = executor.submit(
+                process_fold_input,
+                fold_input=fold_input,
+                data_pipeline_config=data_pipeline_config,
+                model_config=model_config,
+                model_dir=model_dir,
+                output_dir=os.path.join(output_dir, fold_input.sanitised_name()),
+                buckets=buckets,
+                conformer_max_iterations=conformer_max_iterations,
+            )
+            futures.append((fold_input.name, future))
+            print(f"Submitted task for {fold_input.name}")
         
-        # 获取CPU使用策略
-        cpu_affinity = len(psutil.Process().cpu_affinity())
+        # 等待所有任务完成，添加进度跟踪
+        completed = 0
+        total = len(futures)
+        start_time = time.time()
         
-        return {
-            'total_cpus': cpu_count,
-            'physical_cores': physical_count,
-            'available_cpus': cpu_affinity,
-            'numa_nodes': len(set(psutil.Process().cpu_affinity())) // physical_count
-        }
-    except Exception as e:
-        print(f"Warning: Could not get detailed CPU info: {e}")
-        return {
-            'total_cpus': multiprocessing.cpu_count(),
-            'physical_cores': multiprocessing.cpu_count(),
-            'available_cpus': multiprocessing.cpu_count(),
-            'numa_nodes': 1
-        }
-
-def set_cpu_affinity(min_cores=60, max_cores=80):
-    """设置进程的CPU亲和性"""
-    try:
-        process = psutil.Process()
-        all_cpus = list(range(psutil.cpu_count()))
-        
-        # 确保至少使用min_cores个核心
-        num_cores = min(max_cores, max(min_cores, len(all_cpus)))
-        
-        # 设置CPU亲和性
-        process.cpu_affinity(all_cpus[:num_cores])
-        print(f"Set CPU affinity to use {num_cores} cores: {process.cpu_affinity()}")
-        return num_cores
-    except Exception as e:
-        print(f"Warning: Could not set CPU affinity: {e}")
-        return multiprocessing.cpu_count()
-
-def check_system_limits():
-    """检查系统资源限制"""
-    try:
-        import resource
-        # 获取进程数限制
-        soft, hard = resource.getrlimit(resource.RLIMIT_NPROC)
-        print(f"\nProcess limit (soft/hard): {soft}/{hard}")
-        
-        # 获取CPU时间限制
-        soft, hard = resource.getrlimit(resource.RLIMIT_CPU)
-        print(f"CPU time limit (soft/hard): {soft}/{hard}")
-        
-        # 检查cgroup限制
-        try:
-            with open('/sys/fs/cgroup/cpu/cpu.cfs_quota_us') as f:
-                quota = int(f.read())
-            with open('/sys/fs/cgroup/cpu/cpu.cfs_period_us') as f:
-                period = int(f.read())
-            if quota > 0:
-                cgroup_cpus = quota / period
-                print(f"CGroup CPU limit: {cgroup_cpus}")
-        except:
-            pass
-            
-    except Exception as e:
-        print(f"Warning: Could not check system limits: {e}")
+        for name, future in futures:
+            try:
+                future.result()
+                completed += 1
+                elapsed = time.time() - start_time
+                avg_time = elapsed / completed if completed > 0 else 0
+                remaining = total - completed
+                eta = avg_time * remaining if avg_time > 0 else 0
+                
+                print(f"\nProgress: {completed}/{total} ({completed/total*100:.1f}%)")
+                print(f"Completed: {name}")
+                print(f"Average time per task: {avg_time:.1f} seconds")
+                print(f"Estimated time remaining: {eta/60:.1f} minutes")
+                
+                # 打印当前系统资源使用情况
+                cpu_percent = psutil.cpu_percent(interval=1)
+                mem = psutil.virtual_memory()
+                print(f"CPU Usage: {cpu_percent}%")
+                print(f"Memory Usage: {mem.percent}%")
+                
+            except Exception as e:
+                print(f"Error processing {name}: {e}")
+                raise  # 在开发阶段，让错误可见
 
 def main(_):
-    try:
-        # 获取并打印CPU信息
-        cpu_info = get_cpu_info()
-        print("\n=== CPU Configuration ===")
-        print(f"Total CPU threads: {cpu_info['total_cpus']}")
-        print(f"Physical cores: {cpu_info['physical_cores']}")
-        print(f"Available CPUs: {cpu_info['available_cpus']}")
-        print(f"NUMA nodes: {cpu_info['numa_nodes']}")
-        
-        # 设置CPU亲和性
-        num_cores = set_cpu_affinity(min_cores=60, max_cores=80)
-        print(f"\nConfigured to use {num_cores} CPU cores")
-        
-        # 设置线程数环境变量
-        os.environ['MKL_NUM_THREADS'] = str(num_cores)
-        os.environ['OMP_NUM_THREADS'] = str(num_cores)
-        os.environ['OPENBLAS_NUM_THREADS'] = str(num_cores)
-        
-        if _JAX_COMPILATION_CACHE_DIR.value is not None:
-            jax.config.update(
-                'jax_compilation_cache_dir', _JAX_COMPILATION_CACHE_DIR.value
-            )
+  if _JAX_COMPILATION_CACHE_DIR.value is not None:
+    jax.config.update(
+        'jax_compilation_cache_dir', _JAX_COMPILATION_CACHE_DIR.value
+    )
 
-        if _JSON_PATH.value is None == _INPUT_DIR.value is None:
-            raise ValueError(
-                'Exactly one of --json_path or --input_dir must be specified.'
-            )
+  if _JSON_PATH.value is None == _INPUT_DIR.value is None:
+    raise ValueError(
+        'Exactly one of --json_path or --input_dir must be specified.'
+    )
 
-        if not _RUN_INFERENCE.value and not _RUN_DATA_PIPELINE.value:
-            raise ValueError(
-                'At least one of --run_inference or --run_data_pipeline must be'
-                ' set to true.'
-            )
+  if not _RUN_INFERENCE.value and not _RUN_DATA_PIPELINE.value:
+    raise ValueError(
+        'At least one of --run_inference or --run_data_pipeline must be'
+        ' set to true.'
+    )
 
-        if _INPUT_DIR.value is not None:
-            fold_inputs = list(folding_input.load_fold_inputs_from_dir(
-                pathlib.Path(_INPUT_DIR.value)
-            ))
-        elif _JSON_PATH.value is not None:
-            fold_inputs = list(folding_input.load_fold_inputs_from_path(
-                pathlib.Path(_JSON_PATH.value)
-            ))
-        else:
-            raise AssertionError(
-                'Exactly one of --json_path or --input_dir must be specified.'
-            )
+  if _INPUT_DIR.value is not None:
+    fold_inputs = list(folding_input.load_fold_inputs_from_dir(
+        pathlib.Path(_INPUT_DIR.value)
+    ))
+  elif _JSON_PATH.value is not None:
+    fold_inputs = list(folding_input.load_fold_inputs_from_path(
+        pathlib.Path(_JSON_PATH.value)
+    ))
+  else:
+    raise AssertionError(
+        'Exactly one of --json_path or --input_dir must be specified.'
+    )
 
-        # Make sure we can create the output directory before running anything.
-        try:
-            os.makedirs(_OUTPUT_DIR.value, exist_ok=True)
-        except OSError as e:
-            print(f'Failed to create output directory {_OUTPUT_DIR.value}: {e}')
-            raise
+  # Make sure we can create the output directory before running anything.
+  try:
+    os.makedirs(_OUTPUT_DIR.value, exist_ok=True)
+  except OSError as e:
+    print(f'Failed to create output directory {_OUTPUT_DIR.value}: {e}')
+    raise
 
-        notice = textwrap.wrap(
-            'Running AlphaFold 3. Please note that standard AlphaFold 3 model'
-            ' parameters are only available under terms of use provided at'
-            ' https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md.'
-            ' If you do not agree to these terms and are using AlphaFold 3 derived'
-            ' model parameters, cancel execution of AlphaFold 3 inference with'
-            ' CTRL-C, and do not use the model parameters.',
-            break_long_words=False,
-            break_on_hyphens=False,
-            width=80,
-        )
-        print('\n' + '\n'.join(notice) + '\n')
+  notice = textwrap.wrap(
+      'Running AlphaFold 3. Please note that standard AlphaFold 3 model'
+      ' parameters are only available under terms of use provided at'
+      ' https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md.'
+      ' If you do not agree to these terms and are using AlphaFold 3 derived'
+      ' model parameters, cancel execution of AlphaFold 3 inference with'
+      ' CTRL-C, and do not use the model parameters.',
+      break_long_words=False,
+      break_on_hyphens=False,
+      width=80,
+  )
+  print('\n' + '\n'.join(notice) + '\n')
 
-        if _RUN_DATA_PIPELINE.value:
-            expand_path = lambda x: replace_db_dir(x, DB_DIR.value)
-            max_template_date = datetime.date.fromisoformat(_MAX_TEMPLATE_DATE.value)
-            data_pipeline_config = pipeline.DataPipelineConfig(
-                jackhmmer_binary_path=_JACKHMMER_BINARY_PATH.value,
-                nhmmer_binary_path=_NHMMER_BINARY_PATH.value,
-                hmmalign_binary_path=_HMMALIGN_BINARY_PATH.value,
-                hmmsearch_binary_path=_HMMSEARCH_BINARY_PATH.value,
-                hmmbuild_binary_path=_HMMBUILD_BINARY_PATH.value,
-                small_bfd_database_path=expand_path(_SMALL_BFD_DATABASE_PATH.value),
-                mgnify_database_path=expand_path(_MGNIFY_DATABASE_PATH.value),
-                uniprot_cluster_annot_database_path=expand_path(
-                    _UNIPROT_CLUSTER_ANNOT_DATABASE_PATH.value
-                ),
-                uniref90_database_path=expand_path(_UNIREF90_DATABASE_PATH.value),
-                ntrna_database_path=expand_path(_NTRNA_DATABASE_PATH.value),
-                rfam_database_path=expand_path(_RFAM_DATABASE_PATH.value),
-                rna_central_database_path=expand_path(_RNA_CENTRAL_DATABASE_PATH.value),
-                pdb_database_path=expand_path(_PDB_DATABASE_PATH.value),
-                seqres_database_path=expand_path(_SEQRES_DATABASE_PATH.value),
-                jackhmmer_n_cpu=_JACKHMMER_N_CPU.value,
-                nhmmer_n_cpu=_NHMMER_N_CPU.value,
-                max_template_date=max_template_date,
-            )
-        else:
-            data_pipeline_config = None
+  if _RUN_DATA_PIPELINE.value:
+    expand_path = lambda x: replace_db_dir(x, DB_DIR.value)
+    max_template_date = datetime.date.fromisoformat(_MAX_TEMPLATE_DATE.value)
+    data_pipeline_config = pipeline.DataPipelineConfig(
+        jackhmmer_binary_path=_JACKHMMER_BINARY_PATH.value,
+        nhmmer_binary_path=_NHMMER_BINARY_PATH.value,
+        hmmalign_binary_path=_HMMALIGN_BINARY_PATH.value,
+        hmmsearch_binary_path=_HMMSEARCH_BINARY_PATH.value,
+        hmmbuild_binary_path=_HMMBUILD_BINARY_PATH.value,
+        small_bfd_database_path=expand_path(_SMALL_BFD_DATABASE_PATH.value),
+        mgnify_database_path=expand_path(_MGNIFY_DATABASE_PATH.value),
+        uniprot_cluster_annot_database_path=expand_path(
+            _UNIPROT_CLUSTER_ANNOT_DATABASE_PATH.value
+        ),
+        uniref90_database_path=expand_path(_UNIREF90_DATABASE_PATH.value),
+        ntrna_database_path=expand_path(_NTRNA_DATABASE_PATH.value),
+        rfam_database_path=expand_path(_RFAM_DATABASE_PATH.value),
+        rna_central_database_path=expand_path(_RNA_CENTRAL_DATABASE_PATH.value),
+        pdb_database_path=expand_path(_PDB_DATABASE_PATH.value),
+        seqres_database_path=expand_path(_SEQRES_DATABASE_PATH.value),
+        jackhmmer_n_cpu=_JACKHMMER_N_CPU.value,
+        nhmmer_n_cpu=_NHMMER_N_CPU.value,
+        max_template_date=max_template_date,
+    )
+  else:
+    data_pipeline_config = None
 
-        if _RUN_INFERENCE.value:
-            # 创建模型配置
-            model_config = make_model_config(
-                flash_attention_implementation='xla',  # CPU只支持XLA实现
-                num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
-                num_recycles=_NUM_RECYCLES.value,
-                return_embeddings=_SAVE_EMBEDDINGS.value,
-            )
-            model_dir = pathlib.Path(MODEL_DIR.value)
-            
-            # 检查模型参数是否可以加载
-            print('Checking that model parameters can be loaded...')
-            test_runner = create_model_runner(model_config, model_dir)
-            _ = test_runner._get_cached_params('')
-        else:
-            model_config = None
-            model_dir = None
+  if _RUN_INFERENCE.value:
+    # 创建模型配置
+    model_config = make_model_config(
+        flash_attention_implementation='xla',  # CPU只支持XLA实现
+        num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
+        num_recycles=_NUM_RECYCLES.value,
+        return_embeddings=_SAVE_EMBEDDINGS.value,
+    )
+    model_dir = pathlib.Path(MODEL_DIR.value)
+    
+    # 检查模型参数是否可以加载
+    print('Checking that model parameters can be loaded...')
+    test_runner = create_model_runner(model_config, model_dir)
+    _ = test_runner._get_cached_params('')
+  else:
+    model_config = None
+    model_dir = None
 
-        # 在处理fold_inputs之前添加分割逻辑
-        all_split_inputs = []
-        total_original_inputs = len(fold_inputs)
-        
-        print("\n=== Starting input processing and splitting ===")
-        print(f"Number of original inputs: {total_original_inputs}")
-        
-        for fold_input in fold_inputs:
-            if _NUM_SEEDS.value is not None:
-                print(f'Expanding fold job {fold_input.name} to {_NUM_SEEDS.value} seeds')
-                fold_input = fold_input.with_multiple_seeds(_NUM_SEEDS.value)
-            
-            # 分割大型输入，使用500作为阈值
-            split_inputs = split_fold_input(fold_input, max_tokens=500)  # 降低到500
-            all_split_inputs.extend(split_inputs)
-        
-        # 使用并行处理
-        print("\n=== Parallel processing summary ===")
-        print(f"Original inputs: {total_original_inputs}")
-        print(f"After splitting: {len(all_split_inputs)} parts")
-        print(f"Parallel jobs to run: {len(all_split_inputs)}")
-        print("\nSystem information:")
-        print(f"CPU cores available: {multiprocessing.cpu_count()}")
-        print(f"Memory available: {psutil.virtual_memory().available / (1024**3):.1f} GB")
-        print("===================================\n")
-        
-        process_fold_input_parallel(
-            fold_inputs=all_split_inputs,
-            data_pipeline_config=data_pipeline_config,
-            model_config=model_config,
-            model_dir=model_dir,
-            output_dir=_OUTPUT_DIR.value,
-            buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
-            conformer_max_iterations=_CONFORMER_MAX_ITERATIONS.value,
-            max_workers=80,
-            min_workers=60,
-        )
+  # 在处理fold_inputs之前添加分割逻辑
+  all_split_inputs = []
+  total_original_inputs = len(fold_inputs)
+  
+  print("\n=== Starting input processing and splitting ===")
+  print(f"Number of original inputs: {total_original_inputs}")
+  
+  for fold_input in fold_inputs:
+      if _NUM_SEEDS.value is not None:
+          print(f'Expanding fold job {fold_input.name} to {_NUM_SEEDS.value} seeds')
+          fold_input = fold_input.with_multiple_seeds(_NUM_SEEDS.value)
+      
+      # 分割大型输入，使用500作为阈值
+      split_inputs = split_fold_input(fold_input, max_tokens=500)  # 降低到500
+      all_split_inputs.extend(split_inputs)
+  
+  # 使用并行处理
+  print("\n=== Parallel processing summary ===")
+  print(f"Original inputs: {total_original_inputs}")
+  print(f"After splitting: {len(all_split_inputs)} parts")
+  print(f"Parallel jobs to run: {len(all_split_inputs)}")
+  print("\nSystem information:")
+  print(f"CPU cores available: {multiprocessing.cpu_count()}")
+  print(f"Memory available: {psutil.virtual_memory().available / (1024**3):.1f} GB")
+  print("===================================\n")
+  
+  process_fold_input_parallel(
+      fold_inputs=all_split_inputs,
+      data_pipeline_config=data_pipeline_config,
+      model_config=model_config,
+      model_dir=model_dir,
+      output_dir=_OUTPUT_DIR.value,
+      buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
+      conformer_max_iterations=_CONFORMER_MAX_ITERATIONS.value,
+      max_workers=80,
+  )
 
-        print(f'Done running {len(all_split_inputs)} fold jobs.')
-
-    except KeyboardInterrupt:
-        print("\nReceived keyboard interrupt in main process")
-        process_manager.cleanup()
-        sys.exit(1)
-    except Exception as e:
-        print(f"Error in main process: {e}")
-        process_manager.cleanup()
-        raise
+  print(f'Done running {len(all_split_inputs)} fold jobs.')
 
 
 if __name__ == '__main__':
-    flags.mark_flags_as_required(['output_dir'])
-    app.run(main)
+  flags.mark_flags_as_required(['output_dir'])
+  app.run(main)
