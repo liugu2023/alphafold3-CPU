@@ -755,48 +755,87 @@ def predict_structure(
             f' {time.time() - featurisation_start_time:.2f} seconds.'
         )
     
-    # 计算最佳进程数
-    total_tasks = len(fold_input.rng_seeds)
-    cpu_count = multiprocessing.cpu_count()
-    available_memory = psutil.virtual_memory().available
-    memory_per_process = 4 * 1024 * 1024 * 1024  # 估计每个进程4GB内存
+    # 检查是否是分割后的输入
+    is_split_input = '_part' in fold_input.name
     
-    max_processes_by_cpu = min(cpu_count - 1, 80)  # 最多使用80个核心
-    max_processes_by_memory = max(1, available_memory // memory_per_process)
-    num_workers = min(max_processes_by_cpu, max_processes_by_memory, total_tasks)
+    # 如果是分割后的输入，固定使用2个进程
+    if is_split_input:
+        num_workers = 2
+        print("\n=== Using 2 parallel processes for split input ===")
+    else:
+        # 计算最佳进程数
+        total_tasks = len(fold_input.rng_seeds)
+        cpu_count = multiprocessing.cpu_count()
+        available_memory = psutil.virtual_memory().available
+        memory_per_process = 4 * 1024 * 1024 * 1024  # 估计每个进程4GB内存
+        
+        max_processes_by_cpu = min(cpu_count - 1, 80)
+        max_processes_by_memory = max(1, available_memory // memory_per_process)
+        num_workers = min(max_processes_by_cpu, max_processes_by_memory, total_tasks)
     
     print(f"\n=== Model Inference Parallelization ===")
-    print(f"Number of seeds to process: {total_tasks}")
-    print(f"Number of parallel workers: {num_workers}")
+    print(f"Input type: {'Split input' if is_split_input else 'Original input'}")
+    print(f"Number of seeds to process: {len(fold_input.rng_seeds)}")
+    print(f"Number of workers: {num_workers}")
     
     all_inference_start_time = time.time()
     
+    # 如果是分割后的输入，将seeds分成两组
+    if is_split_input:
+        half = len(fold_input.rng_seeds) // 2
+        first_half = list(zip(fold_input.rng_seeds[:half], featurised_examples[:half]))
+        second_half = list(zip(fold_input.rng_seeds[half:], featurised_examples[half:]))
+        print(f"\nSplit seeds distribution:")
+        print(f"Process 1: {len(first_half)} seeds")
+        print(f"Process 2: {len(second_half)} seeds")
+    
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
         futures = []
-        for seed, example in zip(fold_input.rng_seeds, featurised_examples):
-            future = executor.submit(
-                predict_structure_for_seed,
-                seed=seed,
-                featurised_example=example,
-                model_config=model_config,
-                model_dir=model_dir,
-                fold_input=fold_input,
-            )
-            futures.append((seed, future))
-            print(f"Submitted inference task for seed {seed}")
+        
+        if is_split_input:
+            # 为两个进程分别提交任务
+            for i, batch in enumerate([first_half, second_half], 1):
+                for seed, example in batch:
+                    future = executor.submit(
+                        predict_structure_for_seed,
+                        seed=seed,
+                        featurised_example=example,
+                        model_config=model_config,
+                        model_dir=model_dir,
+                        fold_input=fold_input,
+                    )
+                    futures.append((seed, future, i))
+                    print(f"Submitted inference task for seed {seed} to process {i}")
+        else:
+            # 原始的任务提交方式
+            for seed, example in zip(fold_input.rng_seeds, featurised_examples):
+                future = executor.submit(
+                    predict_structure_for_seed,
+                    seed=seed,
+                    featurised_example=example,
+                    model_config=model_config,
+                    model_dir=model_dir,
+                    fold_input=fold_input,
+                )
+                futures.append((seed, future, 0))
+                print(f"Submitted inference task for seed {seed}")
         
         # 收集结果
         all_inference_results = []
-        completed = 0
+        completed = {1: 0, 2: 0} if is_split_input else {0: 0}
         
-        for seed, future in futures:
+        for seed, future, process_id in futures:
             try:
                 result = future.result()
                 all_inference_results.append(result)
-                completed += 1
+                completed[process_id] += 1
                 
                 # 打印进度
-                print(f"\nProgress: {completed}/{total_tasks} seeds completed")
+                if is_split_input:
+                    print(f"\nProcess {process_id} progress: {completed[process_id]}/{len(first_half if process_id==1 else second_half)}")
+                else:
+                    print(f"\nProgress: {completed[0]}/{len(futures)}")
+                
                 print(f"Completed seed: {seed}")
                 
                 # 打印资源使用情况
