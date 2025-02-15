@@ -401,6 +401,38 @@ class CacheManager:
         return self._hits, self._misses
 
 
+class Timer:
+    """用于跟踪和记录各阶段耗时的计时器"""
+    def __init__(self, name: str):
+        self.name = name
+        self.start_time = None
+        self.timings = {}
+        
+    def __enter__(self):
+        self.start_time = time.time()
+        return self
+        
+    def __exit__(self, *args):
+        if self.start_time:
+            elapsed = time.time() - self.start_time
+            self.timings[self.name] = elapsed
+            print(f"\n{self.name} took {elapsed:.2f} seconds")
+            
+    def record(self, stage: str):
+        """记录中间阶段的耗时"""
+        if self.start_time:
+            current = time.time()
+            elapsed = current - self.start_time
+            self.timings[stage] = elapsed
+            print(f"{stage} took {elapsed:.2f} seconds")
+            
+    def summary(self):
+        """打印所有阶段的耗时统计"""
+        print("\nTiming Summary:")
+        for stage, elapsed in self.timings.items():
+            print(f"{stage}: {elapsed:.2f}s")
+
+
 class ModelRunner:
     """添加缓存机制的ModelRunner"""
     def __init__(
@@ -645,57 +677,42 @@ def predict_structure_for_seed(
     model_dir: pathlib.Path,
     fold_input: folding_input.Input,
 ) -> ResultsForSeed:
-    """处理单个seed的预测，添加缓存优化"""
-    
-    with memory_tracker("Model Runner Creation"):
-        model_runner = create_model_runner(model_config, model_dir)
-    
-    # 清理不需要的缓存
-    gc.collect()
-    
-    with memory_tracker("Model Inference"):
-        print(f'Running model inference with seed {seed}...')
-        inference_start_time = time.time()
+    """处理单个seed的预测，添加耗时统计"""
+    with Timer(f"Total prediction for seed {seed}") as timer:
+        # 创建模型运行器
+        with Timer("Model Runner Creation"):
+            model_runner = create_model_runner(model_config, model_dir)
         
-        # 使用确定性的随机数生成
-        rng_key = jax.random.PRNGKey(seed)
-        
-        # 运行推理，使用缓存
-        result = model_runner.run_inference(featurised_example, rng_key)
-        
-        # 打印缓存统计
-        hits, misses = model_runner._cache_manager.get_stats()
-        print(f"Cache stats - hits: {hits}, misses: {misses}")
-        
-        print(
-            f'Running model inference with seed {seed} took'
-            f' {time.time() - inference_start_time:.2f} seconds.'
-        )
-    
-    # 提取需要的数据后释放大型中间结果
-    with memory_tracker("Structure Extraction"):
-        print(f'Extracting output structure samples with seed {seed}...')
-        extract_structures = time.time()
-        
-        # 使用优化后的结构提取
-        inference_results = model_runner.extract_structures(
-            batch=featurised_example, 
-            result=result,
-            target_name=fold_input.name
-        )
-        
-        print(
-            f'Extracting {len(inference_results)} output structure samples with'
-            f' seed {seed} took {time.time() - extract_structures:.2f} seconds.'
-        )
-        
-        embeddings = model_runner.extract_embeddings(result)
-        
-        # 释放大型中间结果
-        del result
-        del model_runner
+        # 清理不需要的缓存
         gc.collect()
-    
+        
+        # 运行推理
+        with Timer("Model Inference"):
+            print(f'Running model inference with seed {seed}...')
+            rng_key = jax.random.PRNGKey(seed)
+            result = model_runner.run_inference(featurised_example, rng_key)
+            
+            # 打印缓存统计
+            hits, misses = model_runner._cache_manager.get_stats()
+            print(f"Cache stats - hits: {hits}, misses: {misses}")
+        
+        # 提取结构
+        with Timer("Structure Extraction"):
+            print(f'Extracting output structure samples with seed {seed}...')
+            inference_results = model_runner.extract_structures(
+                batch=featurised_example, 
+                result=result,
+                target_name=fold_input.name
+            )
+            embeddings = model_runner.extract_embeddings(result)
+            
+            # 释放大型中间结果
+            del result
+            del model_runner
+            gc.collect()
+        
+        timer.record("Final cleanup")
+        
     return ResultsForSeed(
         seed=seed,
         inference_results=inference_results,
@@ -704,45 +721,6 @@ def predict_structure_for_seed(
     )
 
 
-def worker_process(
-    task_queue: multiprocessing.Queue,
-    result_queue: multiprocessing.Queue,
-    model_config: model.Model.Config,
-    model_dir: pathlib.Path,
-):
-    """工作进程处理函数"""
-    try:
-        while True:
-            try:
-                # 非阻塞方式获取任务
-                task = task_queue.get_nowait()
-            except queue.Empty:
-                # 没有任务时退出
-                break
-            
-            seed, featurised_example, fold_input = task
-            
-            try:
-                with memory_tracker(f"Worker Process {os.getpid()}"):
-                    result = predict_structure_for_seed(
-                        seed=seed,
-                        featurised_example=featurised_example,
-                        model_config=model_config,
-                        model_dir=model_dir,
-                        fold_input=fold_input,
-                    )
-                    result_queue.put((seed, result))
-            except Exception as e:
-                print(f"Error in worker {os.getpid()} processing seed {seed}: {e}")
-                result_queue.put((seed, e))
-            
-            # 主动清理内存
-            gc.collect()
-            
-    except Exception as e:
-        print(f"Worker process {os.getpid()} failed: {e}")
-        raise
-
 def predict_structure(
     fold_input: folding_input.Input,
     model_config: model.Model.Config,
@@ -750,129 +728,46 @@ def predict_structure(
     buckets: Sequence[int] | None = None,
     conformer_max_iterations: int | None = None,
 ) -> Sequence[ResultsForSeed]:
-    """并行运行推理管道来预测每个seed的结构，添加动态负载均衡"""
-    
-    with memory_tracker("Data Featurisation"):
-        print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
-        featurisation_start_time = time.time()
-        ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
-        featurised_examples = featurisation.featurise_input(
-            fold_input=fold_input,
-            buckets=buckets,
-            ccd=ccd,
-            verbose=True,
-            conformer_max_iterations=conformer_max_iterations,
-        )
-        print(
-            f'Featurising data with {len(fold_input.rng_seeds)} seed(s) took'
-            f' {time.time() - featurisation_start_time:.2f} seconds.'
-        )
-    
-    # 根据系统资源动态调整进程数
-    available_memory = psutil.virtual_memory().available
-    memory_per_process = 2 * 1024 * 1024 * 1024  # 估计每个进程2GB内存
-    max_processes_by_memory = max(1, available_memory // memory_per_process)
-    
-    num_cpus = multiprocessing.cpu_count()
-    num_workers = min(
-        len(fold_input.rng_seeds),
-        max(1, num_cpus - 1),
-        max_processes_by_memory
-    )
-    
-    print(
-        f'Running parallel model inference with {num_workers} workers for'
-        f' {len(fold_input.rng_seeds)} seed(s)...'
-    )
-    print(f'Available memory: {available_memory / 1024 / 1024:.2f} MB')
-    print(f'Estimated memory per process: {memory_per_process / 1024 / 1024:.2f} MB')
-    
-    # 创建任务队列和结果队列
-    task_queue = multiprocessing.Queue()
-    result_queue = multiprocessing.Queue()
-    
-    # 将任务放入队列
-    for seed, example in zip(fold_input.rng_seeds, featurised_examples):
-        task_queue.put((seed, example, fold_input))
-    
-    # 创建并启动工作进程
-    processes = []
-    for _ in range(num_workers):
-        p = multiprocessing.Process(
-            target=worker_process,
-            args=(task_queue, result_queue, model_config, model_dir)
-        )
-        p.start()
-        processes.append(p)
-    
-    # 收集结果
-    all_inference_results = []
-    completed_seeds = set()
-    total_seeds = len(fold_input.rng_seeds)
-    
-    start_time = time.time()
-    last_progress_time = start_time
-    
-    try:
-        while len(completed_seeds) < total_seeds:
-            try:
-                seed, result = result_queue.get(timeout=300)  # 5分钟超时
-                
-                if isinstance(result, Exception):
-                    print(f"Error processing seed {seed}: {result}")
-                    continue
-                
-                all_inference_results.append(result)
-                completed_seeds.add(seed)
-                
-                # 每30秒打印一次进度
-                current_time = time.time()
-                if current_time - last_progress_time > 30:
-                    elapsed = current_time - start_time
-                    completed = len(completed_seeds)
-                    remaining = total_seeds - completed
-                    rate = completed / elapsed if elapsed > 0 else 0
-                    eta = remaining / rate if rate > 0 else 0
-                    
-                    print(f"Progress: {completed}/{total_seeds} seeds completed")
-                    print(f"Rate: {rate:.2f} seeds/second")
-                    print(f"ETA: {eta/60:.1f} minutes")
-                    
-                    last_progress_time = current_time
-                
-            except queue.Empty:
-                print("Warning: No results received for 5 minutes")
-                
-    except KeyboardInterrupt:
-        print("\nInterrupted by user. Cleaning up...")
-        for p in processes:
-            p.terminate()
-    finally:
-        # 等待所有进程完成
-        for p in processes:
-            p.join()
+    """串行运行推理管道来预测每个seed的结构"""
+    with Timer("Total structure prediction") as timer:
+        # 特征化数据
+        with Timer("Data Featurisation"):
+            print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
+            featurised_examples = featurisation.featurise_input(
+                fold_input=fold_input,
+                buckets=buckets,
+                ccd=chemical_components.cached_ccd(user_ccd=fold_input.user_ccd),
+                verbose=True,
+                conformer_max_iterations=conformer_max_iterations,
+            )
         
-        # 清理队列
-        while not task_queue.empty():
-            try:
-                task_queue.get_nowait()
-            except queue.Empty:
-                break
+        # 串行处理每个seed
+        all_inference_results = []
+        total_seeds = len(fold_input.rng_seeds)
         
-        while not result_queue.empty():
-            try:
-                result_queue.get_nowait()
-            except queue.Empty:
-                break
-    
-    # 按seed排序结果
-    all_inference_results.sort(key=lambda x: x.seed)
-    
-    print(
-        'Running parallel model inference and extracting output structures with'
-        f' {len(fold_input.rng_seeds)} seed(s) took'
-        f' {time.time() - start_time:.2f} seconds.'
-    )
+        print(f'Running serial model inference for {total_seeds} seed(s)...')
+        
+        for seed_idx, (seed, example) in enumerate(zip(fold_input.rng_seeds, featurised_examples)):
+            print(f'\nProcessing seed {seed} ({seed_idx + 1}/{total_seeds})')
+            
+            result = predict_structure_for_seed(
+                seed=seed,
+                featurised_example=example,
+                model_config=model_config,
+                model_dir=model_dir,
+                fold_input=fold_input,
+            )
+            
+            all_inference_results.append(result)
+            
+            # 主动清理内存
+            gc.collect()
+        
+        # 按seed排序结果
+        all_inference_results.sort(key=lambda x: x.seed)
+        
+        timer.record("Results collection")
+        timer.summary()
     
     return all_inference_results
 
