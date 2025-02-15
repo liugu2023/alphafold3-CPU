@@ -1031,8 +1031,7 @@ def split_sequence(fold_input: folding_input.Input, segment_size: int = 50, min_
                 name=split_name,
                 chains=[{
                     'sequence': sequence[start:end],
-                    'name': chain.name,
-                    'description': f"{chain.description}_segment_{i+1}" if chain.description else f"segment_{i+1}"
+                    'description': f"segment_{i+1}"
                 }],
                 rng_seeds=fold_input.rng_seeds,
                 max_recycles=fold_input.max_recycles,
@@ -1051,8 +1050,7 @@ def split_sequence(fold_input: folding_input.Input, segment_size: int = 50, min_
                 name=split_name,
                 chains=[{
                     'sequence': sequence[start:end],
-                    'name': chain.name,
-                    'description': f"{chain.description}_segment_{num_full_segments+1}" if chain.description else f"segment_{num_full_segments+1}"
+                    'description': f"segment_{num_full_segments+1}"
                 }],
                 rng_seeds=fold_input.rng_seeds,
                 max_recycles=fold_input.max_recycles,
