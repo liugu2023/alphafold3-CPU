@@ -50,6 +50,7 @@ from contextlib import contextmanager
 import hashlib
 import json
 import queue
+import sys
 
 from absl import app
 from absl import flags
@@ -448,6 +449,34 @@ class CacheManager:
         
         self._misses += 1
         return None
+
+    def get_stats(self) -> Tuple[int, int]:
+        """返回缓存命中和未命中次数"""
+        return self._hits, self._misses
+    
+    def print_stats(self) -> None:
+        """打印缓存使用统计"""
+        total = self._hits + self._misses
+        hit_rate = (self._hits / total * 100) if total > 0 else 0
+        print("\nCache Statistics:")
+        print(f"  Hits: {self._hits}")
+        print(f"  Misses: {self._misses}")
+        print(f"  Total: {total}")
+        print(f"  Hit Rate: {hit_rate:.1f}%")
+        
+        # 内存缓存统计
+        memory_entries = len(self._memory_cache)
+        memory_size = sum(sys.getsizeof(v) for v in self._memory_cache.values()) / (1024 * 1024)  # MB
+        print("\nMemory Cache:")
+        print(f"  Entries: {memory_entries}")
+        print(f"  Size: {memory_size:.1f}MB")
+        
+        # 磁盘缓存统计
+        disk_entries = len(list(self._cache_dir.glob("*.npz")))
+        disk_size = sum(f.stat().st_size for f in self._cache_dir.glob("*.npz")) / (1024 * 1024)  # MB
+        print("\nDisk Cache:")
+        print(f"  Entries: {disk_entries}")
+        print(f"  Size: {disk_size:.1f}MB")
 
 
 class Timer:
