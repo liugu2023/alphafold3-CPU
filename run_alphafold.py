@@ -1115,6 +1115,100 @@ def merge_results(results: List[List[Tuple[str, Any]]], output_dir: str):
     if os.path.exists(temp_dir):
         shutil.rmtree(temp_dir)
 
+def analyze_and_split_features(
+    fold_inputs: List[folding_input.Input],
+    data_pipeline_config: pipeline.DataPipelineConfig | None,
+    buckets: Sequence[int] | None = None,
+    chunk_size: int = 40,
+) -> Tuple[List[List[Tuple[folding_input.Input, features.BatchDict]]], Dict]:
+    """特征化并分析输入数据，然后进行分割"""
+    
+    print("开始特征化处理...")
+    all_features = []
+    total_size = 0
+    feature_sizes = []
+    
+    # 特征化处理
+    for i, fold_input in enumerate(fold_inputs):
+        print(f"\n处理输入 {i+1}/{len(fold_inputs)}: {fold_input.name}")
+        
+        # 特征化单个输入
+        featurisation_start = time.time()
+        ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
+        features = featurisation.featurise_input(
+            fold_input=fold_input,
+            buckets=buckets,
+            ccd=ccd,
+            verbose=True,
+        )
+        
+        # 计算特征大小
+        feature_size = sum(
+            f.nbytes for f in jax.tree_util.tree_leaves(features)
+            if isinstance(f, (np.ndarray, jnp.ndarray))
+        )
+        feature_sizes.append(feature_size)
+        total_size += feature_size
+        
+        print(f"特征大小: {feature_size / (1024 * 1024):.2f} MB")
+        print(f"特征化耗时: {time.time() - featurisation_start:.2f} 秒")
+        
+        all_features.append((fold_input, features))
+    
+    # 分析特征统计信息
+    stats = {
+        "total_inputs": len(fold_inputs),
+        "total_size_mb": total_size / (1024 * 1024),
+        "avg_size_mb": np.mean(feature_sizes) / (1024 * 1024),
+        "min_size_mb": min(feature_sizes) / (1024 * 1024),
+        "max_size_mb": max(feature_sizes) / (1024 * 1024),
+        "std_size_mb": np.std(feature_sizes) / (1024 * 1024),
+    }
+    
+    print("\n特征化统计信息:")
+    print(f"总输入数量: {stats['total_inputs']}")
+    print(f"总特征大小: {stats['total_size_mb']:.2f} MB")
+    print(f"平均特征大小: {stats['avg_size_mb']:.2f} MB")
+    print(f"最小特征大小: {stats['min_size_mb']:.2f} MB")
+    print(f"最大特征大小: {stats['max_size_mb']:.2f} MB")
+    print(f"特征大小标准差: {stats['std_size_mb']:.2f} MB")
+    
+    # 根据特征大小进行分割
+    chunks = []
+    current_chunk = []
+    current_chunk_size = 0
+    target_chunk_size = total_size / (len(fold_inputs) / chunk_size)
+    
+    for fold_input, features in all_features:
+        feature_size = sum(
+            f.nbytes for f in jax.tree_util.tree_leaves(features)
+            if isinstance(f, (np.ndarray, jnp.ndarray))
+        )
+        
+        if current_chunk_size + feature_size > target_chunk_size and current_chunk:
+            chunks.append(current_chunk)
+            current_chunk = []
+            current_chunk_size = 0
+        
+        current_chunk.append((fold_input, features))
+        current_chunk_size += feature_size
+    
+    if current_chunk:
+        chunks.append(current_chunk)
+    
+    print(f"\n分割结果:")
+    print(f"总分片数: {len(chunks)}")
+    for i, chunk in enumerate(chunks):
+        chunk_size = sum(
+            sum(f.nbytes for f in jax.tree_util.tree_leaves(features)
+                if isinstance(f, (np.ndarray, jnp.ndarray)))
+            for _, features in chunk
+        )
+        print(f"分片 {i+1}: {len(chunk)} 个输入, "
+              f"大小 {chunk_size / (1024 * 1024):.2f} MB")
+    
+    return chunks, stats
+
 def main(_):
     if _JAX_COMPILATION_CACHE_DIR.value is not None:
         jax.config.update(
@@ -1222,13 +1316,23 @@ def main(_):
         model_config = None
         model_dir = None
 
+    # 特征化和分析
+    chunks, stats = analyze_and_split_features(
+        fold_inputs=fold_inputs,
+        data_pipeline_config=data_pipeline_config,
+        buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
+        chunk_size=40
+    )
+    
+    print("\n是否继续处理? (y/n)")
+    response = input().strip().lower()
+    if response != 'y':
+        print("程序终止")
+        return
+    
     # 创建临时目录
     temp_dir = os.path.join(_OUTPUT_DIR.value, 'temp')
     os.makedirs(temp_dir, exist_ok=True)
-
-    # 分割输入
-    chunks = split_fold_inputs(fold_inputs, chunk_size=40)
-    print(f"Split {len(fold_inputs)} inputs into {len(chunks)} chunks")
 
     # 创建进程池
     max_workers = min(len(chunks), multiprocessing.cpu_count() - 1)
