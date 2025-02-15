@@ -1095,31 +1095,52 @@ def process_chunk(
         results.append((fold_input.sanitised_name(), result))
     return results
 
-def merge_results(results: List[List[Tuple[str, Any]]], output_dir: str):
-    """合并所有临时结果到最终输出目录"""
-    temp_dir = os.path.join(output_dir, 'temp')
+def split_features(features: features.BatchDict, target_size: int) -> List[features.BatchDict]:
+    """将大型特征分割成更小的块"""
+    # 获取序列长度
+    seq_length = features['seq_length'][0]
     
-    for chunk_results in results:
-        for name, _ in chunk_results:
-            temp_path = os.path.join(temp_dir, name)
-            final_path = os.path.join(output_dir, name)
-            
-            # 移动文件到最终位置
-            if os.path.exists(temp_path):
-                if not os.path.exists(final_path):
-                    shutil.move(temp_path, final_path)
+    # 计算需要分成几个块
+    feature_size = sum(
+        f.nbytes for f in jax.tree_util.tree_leaves(features)
+        if isinstance(f, (np.ndarray, jnp.ndarray))
+    )
+    num_splits = max(1, int(np.ceil(feature_size / target_size)))
+    
+    # 计算每个块的序列长度
+    split_size = int(np.ceil(seq_length / num_splits))
+    
+    split_features = []
+    for i in range(num_splits):
+        start_idx = i * split_size
+        end_idx = min((i + 1) * split_size, seq_length)
+        
+        # 创建新的特征字典
+        split_dict = {}
+        for key, value in features.items():
+            if isinstance(value, np.ndarray):
+                # 根据特征的维度进行切片
+                if value.shape[0] == seq_length:
+                    split_dict[key] = value[start_idx:end_idx]
+                elif len(value.shape) > 1 and value.shape[1] == seq_length:
+                    split_dict[key] = value[:, start_idx:end_idx]
                 else:
-                    shutil.rmtree(temp_path)
-
-    # 清理临时目录
-    if os.path.exists(temp_dir):
-        shutil.rmtree(temp_dir)
+                    split_dict[key] = value
+            else:
+                split_dict[key] = value
+        
+        # 更新序列长度
+        split_dict['seq_length'] = np.array([end_idx - start_idx], dtype=np.int32)
+        
+        split_features.append(split_dict)
+    
+    return split_features
 
 def analyze_and_split_features(
     fold_inputs: List[folding_input.Input],
     data_pipeline_config: pipeline.DataPipelineConfig | None,
     buckets: Sequence[int] | None = None,
-    target_chunk_size_mb: float = 10.0,  # 目标分片大小，单位MB
+    target_chunk_size_mb: float = 10.0,
 ) -> Tuple[List[List[Tuple[folding_input.Input, features.BatchDict]]], Dict]:
     """特征化并分析输入数据，然后进行分割"""
     
@@ -1185,13 +1206,23 @@ def analyze_and_split_features(
             if isinstance(f, (np.ndarray, jnp.ndarray))
         )
         
-        # 如果单个特征大于目标大小，单独作为一个分片
+        # 如果单个特征大于目标大小，进行分割
         if feature_size > target_chunk_size:
             if current_chunk:
                 chunks.append(current_chunk)
                 current_chunk = []
                 current_chunk_size = 0
-            chunks.append([(fold_input, features)])
+            
+            # 分割大型特征
+            split_features_list = split_features(features, target_chunk_size)
+            for i, split_feat in enumerate(split_features_list):
+                # 创建新的fold_input，添加分片信息
+                split_name = f"{fold_input.name}_split_{i+1}"
+                split_input = dataclasses.replace(
+                    fold_input,
+                    name=split_name
+                )
+                chunks.append([(split_input, split_feat)])
             continue
         
         # 如果当前分片加上新特征会超过目标大小，创建新分片
@@ -1203,7 +1234,6 @@ def analyze_and_split_features(
         current_chunk.append((fold_input, features))
         current_chunk_size += feature_size
     
-    # 添加最后一个分片
     if current_chunk:
         chunks.append(current_chunk)
     
