@@ -315,7 +315,43 @@ class CacheManager:
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         self._hits = 0
         self._misses = 0
+    
+    def _get_cache_key(self, *args, **kwargs) -> str:
+        """生成缓存键"""
+        def make_hashable(obj):
+            if isinstance(obj, np.ndarray):
+                # 对于numpy数组，使用其形状和内容的哈希值
+                return f"array_shape={obj.shape}_hash={hash(obj.tobytes())}"
+            if isinstance(obj, (dict, list, set)):
+                # 递归处理嵌套结构
+                if isinstance(obj, dict):
+                    return f"dict_{hash(tuple((k, make_hashable(v)) for k, v in sorted(obj.items())))}"
+                return f"{type(obj).__name__}_{hash(tuple(make_hashable(x) for x in obj))}"
+            if hasattr(obj, '__dict__'):
+                # 处理自定义对象
+                return f"{obj.__class__.__name__}_{hash(str(obj.__dict__))}"
+            return str(obj)
         
+        # 组合所有参数的哈希值
+        key_parts = []
+        for arg in args:
+            try:
+                key_parts.append(make_hashable(arg))
+            except Exception as e:
+                print(f"Warning: Failed to hash argument {type(arg)}: {e}")
+                key_parts.append(f"unhashable_{type(arg).__name__}")
+        
+        for k, v in sorted(kwargs.items()):
+            try:
+                key_parts.append(f"{k}={make_hashable(v)}")
+            except Exception as e:
+                print(f"Warning: Failed to hash kwarg {k}: {e}")
+                key_parts.append(f"{k}=unhashable_{type(v).__name__}")
+        
+        # 生成最终的哈希值
+        combined = "_".join(key_parts)
+        return hashlib.sha256(combined.encode()).hexdigest()
+    
     def _serialize_value(self, value: Any) -> Any:
         """序列化值以便存储"""
         if isinstance(value, np.ndarray):
