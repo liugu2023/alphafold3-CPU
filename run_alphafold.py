@@ -1003,11 +1003,108 @@ def process_fold_input(
     return output
 
 
-def split_fold_inputs(fold_inputs: Sequence[folding_input.Input], chunk_size: int = 40) -> List[List[folding_input.Input]]:
-    """将输入分割成固定大小的块"""
-    # 将生成器转换为列表
-    inputs_list = list(fold_inputs)
-    return [inputs_list[i:i + chunk_size] for i in range(0, len(inputs_list), chunk_size)]
+def split_sequence(fold_input: folding_input.Input, segment_size: int = 50, min_segment_size: int = 10) -> List[folding_input.Input]:
+    """将单个序列分割成固定长度的片段，过小的末尾片段会合并到前一个片段"""
+    split_inputs = []
+    
+    for chain in fold_input.chains:
+        sequence = chain.sequence
+        # 计算完整片段数和剩余长度
+        num_full_segments = len(sequence) // segment_size
+        remainder = len(sequence) % segment_size
+        
+        # 如果剩余部分太小，调整最后一个完整片段的大小
+        if remainder > 0 and remainder < min_segment_size:
+            num_full_segments -= 1
+            last_segment_size = segment_size + remainder
+        else:
+            last_segment_size = remainder
+        
+        # 创建完整的片段
+        for i in range(num_full_segments):
+            start = i * segment_size
+            end = (i + 1) * segment_size
+            
+            # 创建新的chain
+            new_chain = dataclasses.replace(
+                chain,
+                sequence=sequence[start:end]
+            )
+            
+            # 创建新的fold_input
+            split_name = f"{fold_input.name}_segment_{i+1}"
+            split_input = dataclasses.replace(
+                fold_input,
+                name=split_name,
+                chains=[new_chain]
+            )
+            
+            split_inputs.append(split_input)
+        
+        # 处理最后一个片段（如果有）
+        if num_full_segments * segment_size < len(sequence):
+            start = num_full_segments * segment_size
+            end = len(sequence)
+            
+            new_chain = dataclasses.replace(
+                chain,
+                sequence=sequence[start:end]
+            )
+            
+            split_name = f"{fold_input.name}_segment_{num_full_segments+1}"
+            split_input = dataclasses.replace(
+                fold_input,
+                name=split_name,
+                chains=[new_chain]
+            )
+            
+            split_inputs.append(split_input)
+    
+    return split_inputs
+
+def analyze_and_split_inputs(
+    fold_inputs: List[folding_input.Input],
+    segment_size: int = 50,  # 每片50个氨基酸
+    min_segment_size: int = 10  # 最小片段大小
+) -> Tuple[List[List[folding_input.Input]], Dict]:
+    """分析并分割输入文件的序列"""
+    
+    print("\n分析输入文件...")
+    all_split_inputs = []
+    
+    for fold_input in fold_inputs:
+        # 分割每个输入的序列
+        split_inputs = split_sequence(
+            fold_input, 
+            segment_size=segment_size,
+            min_segment_size=min_segment_size
+        )
+        all_split_inputs.extend(split_inputs)
+        
+        total_length = sum(len(chain.sequence) for chain in fold_input.chains)
+        print(f"\n原始输入 {fold_input.name}:")
+        print(f"序列长度: {total_length}")
+        print(f"分割数量: {len(split_inputs)}")
+        for i, split in enumerate(split_inputs):
+            split_length = sum(len(chain.sequence) for chain in split.chains)
+            print(f"分片 {i+1}: 长度={split_length}, 名称={split.name}")
+    
+    # 计算统计信息
+    stats = {
+        "total_inputs": len(fold_inputs),
+        "total_splits": len(all_split_inputs),
+        "segment_size": segment_size,
+    }
+    
+    print("\n分割统计信息:")
+    print(f"原始输入数量: {stats['total_inputs']}")
+    print(f"分割后片段数量: {stats['total_splits']}")
+    print(f"目标片段大小: {stats['segment_size']}")
+    
+    # 将分割后的输入组织成块
+    chunks = [all_split_inputs]
+    
+    return chunks, stats
 
 def get_system_resources():
     """获取系统资源使用情况"""
@@ -1043,50 +1140,6 @@ def process_chunk(
         )
         results.append((fold_input.sanitised_name(), result))
     return results
-
-def analyze_and_split_inputs(
-    fold_inputs: List[folding_input.Input],
-    chunk_size: int = 50  # 修改为50个输入文件为一片
-) -> Tuple[List[List[folding_input.Input]], Dict]:
-    """分析并分割输入文件"""
-    
-    print("\n分析输入文件...")
-    input_sizes = []  # 记录每个输入的序列长度
-    
-    for fold_input in fold_inputs:
-        total_length = sum(len(chain.sequence) for chain in fold_input.chains)
-        input_sizes.append(total_length)
-    
-    # 计算统计信息
-    stats = {
-        "total_inputs": len(fold_inputs),
-        "total_length": sum(input_sizes),
-        "avg_length": np.mean(input_sizes),
-        "min_length": min(input_sizes),
-        "max_length": max(input_sizes),
-        "std_length": np.std(input_sizes),
-    }
-    
-    print("\n输入文件统计信息:")
-    print(f"总输入数量: {stats['total_inputs']}")
-    print(f"总序列长度: {stats['total_length']}")
-    print(f"平均序列长度: {stats['avg_length']:.2f}")
-    print(f"最短序列长度: {stats['min_length']}")
-    print(f"最长序列长度: {stats['max_length']}")
-    print(f"序列长度标准差: {stats['std_length']:.2f}")
-    
-    # 分割输入，每片50个
-    chunks = [fold_inputs[i:i + chunk_size] for i in range(0, len(fold_inputs), chunk_size)]
-    
-    print(f"\n分割结果:")
-    print(f"总分片数: {len(chunks)}")
-    for i, chunk in enumerate(chunks):
-        chunk_length = sum(sum(len(chain.sequence) for chain in input.chains) for input in chunk)
-        print(f"分片 {i+1}: {len(chunk)} 个输入, 总序列长度: {chunk_length}")
-        input_names = [input.name for input in chunk]
-        print(f"包含输入: {', '.join(input_names)}")
-    
-    return chunks, stats
 
 def main(_):
     if _JAX_COMPILATION_CACHE_DIR.value is not None:
@@ -1195,10 +1248,11 @@ def main(_):
         model_config = None
         model_dir = None
 
-    # 分割输入文件，使用50个输入为一片
+    # 分割输入序列，每个片段50个氨基酸
     chunks, stats = analyze_and_split_inputs(
         fold_inputs=fold_inputs,
-        chunk_size=50  # 修改为50
+        segment_size=50,  # 改为50
+        min_segment_size=10  # 最小片段大小
     )
     
     print("\n是否继续处理? (y/n)")
