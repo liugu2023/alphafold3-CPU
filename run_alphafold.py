@@ -1098,7 +1098,18 @@ def process_chunk(
 def split_features(features: features.BatchDict, target_size: int) -> List[features.BatchDict]:
     """将大型特征分割成更小的块"""
     # 获取序列长度
-    seq_length = features['seq_length'][0]
+    if isinstance(features['seq_length'], np.ndarray):
+        seq_length = features['seq_length'][0]
+    else:
+        seq_length = features['seq_length']
+    
+    # 打印特征的结构，帮助调试
+    print("\n特征结构:")
+    for key, value in features.items():
+        if isinstance(value, np.ndarray):
+            print(f"{key}: shape={value.shape}, dtype={value.dtype}")
+        else:
+            print(f"{key}: type={type(value)}")
     
     # 计算需要分成几个块
     feature_size = sum(
@@ -1107,8 +1118,12 @@ def split_features(features: features.BatchDict, target_size: int) -> List[featu
     )
     num_splits = max(1, int(np.ceil(feature_size / target_size)))
     
+    print(f"\n特征总大小: {feature_size / (1024 * 1024):.2f} MB")
+    print(f"分割数量: {num_splits}")
+    
     # 计算每个块的序列长度
     split_size = int(np.ceil(seq_length / num_splits))
+    print(f"每块大小: {split_size}")
     
     split_features = []
     for i in range(num_splits):
@@ -1119,20 +1134,32 @@ def split_features(features: features.BatchDict, target_size: int) -> List[featu
         split_dict = {}
         for key, value in features.items():
             if isinstance(value, np.ndarray):
-                # 根据特征的维度进行切片
-                if value.shape[0] == seq_length:
+                # 检查数组的形状
+                if len(value.shape) == 0:
+                    # 标量数组
+                    split_dict[key] = value
+                elif value.shape[0] == seq_length:
+                    # 第一维是序列长度
                     split_dict[key] = value[start_idx:end_idx]
                 elif len(value.shape) > 1 and value.shape[1] == seq_length:
+                    # 第二维是序列长度
                     split_dict[key] = value[:, start_idx:end_idx]
                 else:
+                    # 其他情况，保持原样
                     split_dict[key] = value
             else:
+                # 非数组类型，直接复制
                 split_dict[key] = value
         
         # 更新序列长度
-        split_dict['seq_length'] = np.array([end_idx - start_idx], dtype=np.int32)
+        if isinstance(features['seq_length'], np.ndarray):
+            split_dict['seq_length'] = np.array([end_idx - start_idx], dtype=np.int32)
+        else:
+            split_dict['seq_length'] = end_idx - start_idx
         
         split_features.append(split_dict)
+        
+        print(f"分片 {i+1}: {start_idx}-{end_idx}, 长度={end_idx-start_idx}")
     
     return split_features
 
