@@ -219,11 +219,6 @@ _JAX_COMPILATION_CACHE_DIR = flags.DEFINE_string(
     None,
     'Path to a directory for the JAX compilation cache.',
 )
-_GPU_DEVICE = flags.DEFINE_integer(
-    'gpu_device',
-    None,  # 改为None默认值
-    'Deprecated: GPU device selection is not supported in CPU-only mode.',
-)
 _BUCKETS = flags.DEFINE_list(
     'buckets',
     # pyformat: disable
@@ -233,19 +228,6 @@ _BUCKETS = flags.DEFINE_list(
     'Strictly increasing order of token sizes for which to cache compilations.'
     ' For any input with more tokens than the largest bucket size, a new bucket'
     ' is created for exactly that number of tokens.',
-)
-_FLASH_ATTENTION_IMPLEMENTATION = flags.DEFINE_enum(
-    'flash_attention_implementation',
-    default='triton',
-    enum_values=['triton', 'cudnn', 'xla'],
-    help=(
-        "Flash attention implementation to use. 'triton' and 'cudnn' uses a"
-        ' Triton and cuDNN flash attention implementation, respectively. The'
-        ' Triton kernel is fastest and has been tested more thoroughly. The'
-        " Triton and cuDNN kernels require Ampere GPUs or later. 'xla' uses an"
-        ' XLA attention implementation (no flash attention) and is portable'
-        ' across GPU devices.'
-    ),
 )
 _NUM_RECYCLES = flags.DEFINE_integer(
     'num_recycles',
@@ -566,49 +548,16 @@ class ResultsForSeed:
 
 
 def create_model_runner(model_config, model_dir):
-    """在每个进程中创建ModelRunner，添加计算优化"""
-    # 设置JAX优化选项
-    jax.config.update('jax_enable_x64', False)  # 使用float32以提高性能
-    jax.config.update('jax_default_matmul_precision', 'bfloat16')  # 使用bfloat16加速矩阵运算
-    
-    # 设置CPU线程数
-    num_physical_cores = psutil.cpu_count(logical=False)  # 物理核心数
-    threads_per_core = 2  # 每个核心的线程数
-    
-    # 为每个进程分配合适的线程数
-    process_threads = max(1, num_physical_cores // 2)
-    
-    # 设置线程亲和性和线程数
-    os.environ['OMP_NUM_THREADS'] = str(process_threads)
-    os.environ['MKL_NUM_THREADS'] = str(process_threads)
-    os.environ['OPENBLAS_NUM_THREADS'] = str(process_threads)
-    os.environ['VECLIB_MAXIMUM_THREADS'] = str(process_threads)
-    
-    # 启用Intel MKL优化
-    os.environ['MKL_DEBUG_CPU_TYPE'] = '5'  # 启用高级指令集
-    os.environ['MKL_ENABLE_INSTRUCTIONS'] = 'AVX2'  # 使用AVX2指令集
-    
-    # 设置CPU亲和性策略
-    os.environ['KMP_AFFINITY'] = 'granularity=fine,compact,1,0'
-    
-    # 优化内存分配
-    os.environ['MKL_DYNAMIC'] = 'FALSE'  # 禁用动态调整以提高稳定性
-    
-    print(f"Optimized thread settings:")
-    print(f"Physical cores: {num_physical_cores}")
-    print(f"Threads per process: {process_threads}")
-    
+    """在每个进程中创建ModelRunner"""
     # 使用CPU设备
     devices = jax.local_devices(backend='cpu')
     print(f'Creating model runner with CPU device: {devices[0]}')
     
-    # 创建优化后的ModelRunner
     model_runner = ModelRunner(
         config=model_config,
         device=devices[0],
         model_dir=model_dir,
     )
-    
     return model_runner
 
 
@@ -1095,229 +1044,46 @@ def process_chunk(
         results.append((fold_input.sanitised_name(), result))
     return results
 
-def split_features(features: features.BatchDict, target_size: int) -> List[features.BatchDict]:
-    """将大型特征分割成更小的块"""
-    # 首先打印特征的完整结构
-    print("\n完整特征结构:")
-    for key, value in features.items():
-        print(f"\nKey: {key}")
-        print(f"Type: {type(value)}")
-        if isinstance(value, (list, tuple)):
-            print(f"Length: {len(value)}")
-            if value:
-                print(f"First element type: {type(value[0])}")
-                if isinstance(value[0], np.ndarray):
-                    print(f"First element shape: {value[0].shape}")
-        elif isinstance(value, np.ndarray):
-            print(f"Shape: {value.shape}")
-            print(f"Dtype: {value.dtype}")
-        elif isinstance(value, dict):
-            print("Dictionary contents:")
-            for k, v in value.items():
-                print(f"  {k}: {type(v)}")
-    
-    # 获取序列长度
-    try:
-        if isinstance(features['seq_length'], list):
-            seq_length = features['seq_length'][0]
-            if isinstance(seq_length, np.ndarray):
-                seq_length = seq_length[0]
-        elif isinstance(features['seq_length'], np.ndarray):
-            seq_length = features['seq_length'][0]
-        else:
-            seq_length = features['seq_length']
-        
-        print(f"\n序列长度: {seq_length}")
-    except Exception as e:
-        print(f"获取序列长度时出错: {e}")
-        print(f"seq_length的实际值: {features['seq_length']}")
-        raise
-    
-    # 计算特征大小
-    feature_size = 0
-    for key, value in features.items():
-        if isinstance(value, list):
-            for item in value:
-                if isinstance(item, np.ndarray):
-                    feature_size += item.nbytes
-        elif isinstance(value, np.ndarray):
-            feature_size += value.nbytes
-    
-    print(f"\n特征总大小: {feature_size / (1024 * 1024):.2f} MB")
-    
-    # 计算分割数量
-    num_splits = max(1, int(np.ceil(feature_size / target_size)))
-    print(f"分割数量: {num_splits}")
-    
-    # 计算每个块的大小
-    split_size = int(np.ceil(seq_length / num_splits))
-    print(f"每块大小: {split_size}")
-    
-    # 进行分割
-    split_features = []
-    for i in range(num_splits):
-        start_idx = i * split_size
-        end_idx = min((i + 1) * split_size, seq_length)
-        
-        print(f"\n创建分片 {i+1}/{num_splits} ({start_idx}:{end_idx})")
-        
-        # 创建新的特征字典
-        split_dict = {}
-        for key, value in features.items():
-            try:
-                if isinstance(value, list):
-                    # 处理列表类型的特征
-                    split_dict[key] = [
-                        item[start_idx:end_idx] if isinstance(item, np.ndarray) and item.shape[0] == seq_length
-                        else item[:, start_idx:end_idx] if isinstance(item, np.ndarray) and len(item.shape) > 1 and item.shape[1] == seq_length
-                        else item
-                        for item in value
-                    ]
-                elif isinstance(value, np.ndarray):
-                    # 处理numpy数组
-                    if len(value.shape) == 0:
-                        split_dict[key] = value
-                    elif value.shape[0] == seq_length:
-                        split_dict[key] = value[start_idx:end_idx]
-                    elif len(value.shape) > 1 and value.shape[1] == seq_length:
-                        split_dict[key] = value[:, start_idx:end_idx]
-                    else:
-                        split_dict[key] = value
-                else:
-                    # 其他类型直接复制
-                    split_dict[key] = value
-            except Exception as e:
-                print(f"处理特征 {key} 时出错: {e}")
-                print(f"特征值类型: {type(value)}")
-                if isinstance(value, (list, np.ndarray)):
-                    print(f"特征值形状/长度: {len(value) if isinstance(value, list) else value.shape}")
-                raise
-        
-        # 更新序列长度
-        if isinstance(features['seq_length'], list):
-            split_dict['seq_length'] = [np.array([end_idx - start_idx], dtype=np.int32)]
-        else:
-            split_dict['seq_length'] = np.array([end_idx - start_idx], dtype=np.int32)
-        
-        split_features.append(split_dict)
-        print(f"分片 {i+1} 创建完成")
-    
-    return split_features
-
-def analyze_and_split_features(
+def analyze_and_split_inputs(
     fold_inputs: List[folding_input.Input],
-    data_pipeline_config: pipeline.DataPipelineConfig | None,
-    buckets: Sequence[int] | None = None,
-    target_chunk_size_mb: float = 10.0,
-) -> Tuple[List[List[Tuple[folding_input.Input, features.BatchDict]]], Dict]:
-    """特征化并分析输入数据，然后进行分割"""
+    chunk_size: int = 5  # 每个分片包含的输入文件数量
+) -> Tuple[List[List[folding_input.Input]], Dict]:
+    """分析并分割输入文件"""
     
-    print("开始特征化处理...")
-    all_features = []
-    total_size = 0
-    feature_sizes = []
+    print("\n分析输入文件...")
+    input_sizes = []  # 记录每个输入的序列长度
     
-    # 特征化处理
-    for i, fold_input in enumerate(fold_inputs):
-        print(f"\n处理输入 {i+1}/{len(fold_inputs)}: {fold_input.name}")
-        
-        # 特征化单个输入
-        featurisation_start = time.time()
-        ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
-        features = featurisation.featurise_input(
-            fold_input=fold_input,
-            buckets=buckets,
-            ccd=ccd,
-            verbose=True,
-        )
-        
-        # 计算特征大小
-        feature_size = sum(
-            f.nbytes for f in jax.tree_util.tree_leaves(features)
-            if isinstance(f, (np.ndarray, jnp.ndarray))
-        )
-        feature_sizes.append(feature_size)
-        total_size += feature_size
-        
-        print(f"特征大小: {feature_size / (1024 * 1024):.2f} MB")
-        print(f"特征化耗时: {time.time() - featurisation_start:.2f} 秒")
-        
-        all_features.append((fold_input, features))
+    for fold_input in fold_inputs:
+        total_length = sum(len(chain.sequence) for chain in fold_input.chains)
+        input_sizes.append(total_length)
     
-    # 分析特征统计信息
+    # 计算统计信息
     stats = {
         "total_inputs": len(fold_inputs),
-        "total_size_mb": total_size / (1024 * 1024),
-        "avg_size_mb": np.mean(feature_sizes) / (1024 * 1024),
-        "min_size_mb": min(feature_sizes) / (1024 * 1024),
-        "max_size_mb": max(feature_sizes) / (1024 * 1024),
-        "std_size_mb": np.std(feature_sizes) / (1024 * 1024),
+        "total_length": sum(input_sizes),
+        "avg_length": np.mean(input_sizes),
+        "min_length": min(input_sizes),
+        "max_length": max(input_sizes),
+        "std_length": np.std(input_sizes),
     }
     
-    print("\n特征化统计信息:")
+    print("\n输入文件统计信息:")
     print(f"总输入数量: {stats['total_inputs']}")
-    print(f"总特征大小: {stats['total_size_mb']:.2f} MB")
-    print(f"平均特征大小: {stats['avg_size_mb']:.2f} MB")
-    print(f"最小特征大小: {stats['min_size_mb']:.2f} MB")
-    print(f"最大特征大小: {stats['max_size_mb']:.2f} MB")
-    print(f"特征大小标准差: {stats['std_size_mb']:.2f} MB")
+    print(f"总序列长度: {stats['total_length']}")
+    print(f"平均序列长度: {stats['avg_length']:.2f}")
+    print(f"最短序列长度: {stats['min_length']}")
+    print(f"最长序列长度: {stats['max_length']}")
+    print(f"序列长度标准差: {stats['std_length']:.2f}")
     
-    # 根据固定大小进行分割
-    target_chunk_size = target_chunk_size_mb * 1024 * 1024  # 转换为字节
-    chunks = []
-    current_chunk = []
-    current_chunk_size = 0
-    
-    for fold_input, features in all_features:
-        feature_size = sum(
-            f.nbytes for f in jax.tree_util.tree_leaves(features)
-            if isinstance(f, (np.ndarray, jnp.ndarray))
-        )
-        
-        # 如果单个特征大于目标大小，进行分割
-        if feature_size > target_chunk_size:
-            if current_chunk:
-                chunks.append(current_chunk)
-                current_chunk = []
-                current_chunk_size = 0
-            
-            # 分割大型特征
-            split_features_list = split_features(features, target_chunk_size)
-            for i, split_feat in enumerate(split_features_list):
-                # 创建新的fold_input，添加分片信息
-                split_name = f"{fold_input.name}_split_{i+1}"
-                split_input = dataclasses.replace(
-                    fold_input,
-                    name=split_name
-                )
-                chunks.append([(split_input, split_feat)])
-            continue
-        
-        # 如果当前分片加上新特征会超过目标大小，创建新分片
-        if current_chunk_size + feature_size > target_chunk_size and current_chunk:
-            chunks.append(current_chunk)
-            current_chunk = []
-            current_chunk_size = 0
-        
-        current_chunk.append((fold_input, features))
-        current_chunk_size += feature_size
-    
-    if current_chunk:
-        chunks.append(current_chunk)
+    # 分割输入
+    chunks = [fold_inputs[i:i + chunk_size] for i in range(0, len(fold_inputs), chunk_size)]
     
     print(f"\n分割结果:")
     print(f"总分片数: {len(chunks)}")
     for i, chunk in enumerate(chunks):
-        chunk_size = sum(
-            sum(f.nbytes for f in jax.tree_util.tree_leaves(features)
-                if isinstance(f, (np.ndarray, jnp.ndarray)))
-            for _, features in chunk
-        )
-        print(f"分片 {i+1}: {len(chunk)} 个输入, "
-              f"大小 {chunk_size / (1024 * 1024):.2f} MB")
-        
-        # 打印该分片中的输入名称
-        input_names = [fold_input.name for fold_input, _ in chunk]
+        chunk_length = sum(sum(len(chain.sequence) for chain in input.chains) for input in chunk)
+        print(f"分片 {i+1}: {len(chunk)} 个输入, 总序列长度: {chunk_length}")
+        input_names = [input.name for input in chunk]
         print(f"包含输入: {', '.join(input_names)}")
     
     return chunks, stats
@@ -1429,12 +1195,10 @@ def main(_):
         model_config = None
         model_dir = None
 
-    # 特征化和分析，使用10MB作为目标分片大小
-    chunks, stats = analyze_and_split_features(
+    # 分割输入文件
+    chunks, stats = analyze_and_split_inputs(
         fold_inputs=fold_inputs,
-        data_pipeline_config=data_pipeline_config,
-        buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
-        target_chunk_size_mb=10.0
+        chunk_size=5  # 每个分片5个输入文件
     )
     
     print("\n是否继续处理? (y/n)")
@@ -1449,7 +1213,6 @@ def main(_):
 
     # 创建进程池
     max_workers = min(len(chunks), multiprocessing.cpu_count() - 1)
-    all_results = []
     active_processes = []
     chunk_queue = list(enumerate(chunks))
 
@@ -1494,9 +1257,6 @@ def main(_):
         
         # 短暂休眠以避免过度检查
         time.sleep(5)
-
-    # 合并结果
-    merge_results(all_results, _OUTPUT_DIR.value)
 
     print(f'Done running {len(fold_inputs)} fold jobs.')
 
