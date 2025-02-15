@@ -433,6 +433,63 @@ class Timer:
             print(f"{stage}: {elapsed:.2f}s")
 
 
+class NumericsHandler:
+    """处理数值计算相关的优化"""
+    
+    @staticmethod
+    def handle_coordinate_numerics(value: np.ndarray) -> np.ndarray:
+        """处理坐标相关的数值问题"""
+        mask = np.isnan(value) | np.isinf(value)
+        if mask.any():
+            valid_values = value[~mask]
+            if len(valid_values) > 0:
+                # 使用有效值的平均值
+                fill_value = np.mean(valid_values)
+            else:
+                # 如果没有有效值，使用0
+                fill_value = 0.0
+            value = np.where(mask, fill_value, value)
+        return np.clip(value, -1e6, 1e6)  # 限制在合理范围内
+    
+    @staticmethod
+    def handle_general_numerics(value: np.ndarray) -> np.ndarray:
+        """处理一般数值问题"""
+        # 替换NaN和Inf
+        value = np.nan_to_num(value, nan=0.0, posinf=1e6, neginf=-1e6)
+        return np.clip(value, -1e6, 1e6)
+    
+    @staticmethod
+    def fix_numerics(value: Any, key: str = "") -> Any:
+        """修复数值问题的通用方法"""
+        if isinstance(value, (np.ndarray, jnp.ndarray)):
+            if np.any(np.isnan(value)) or np.any(np.isinf(value)):
+                print(f"Warning: Found NaN/inf in {key}")
+                print(f"Shape: {value.shape}")
+                print(f"NaN count: {np.isnan(value).sum()}")
+                print(f"Inf count: {np.isinf(value).sum()}")
+                
+                # 对于坐标相关的键，使用特殊处理
+                if any(coord in key.lower() for coord in ['coord', 'pos', 'xyz', 'position']):
+                    return NumericsHandler.handle_coordinate_numerics(value)
+                else:
+                    return NumericsHandler.handle_general_numerics(value)
+        return value
+
+    @staticmethod
+    def check_output_numerics(result: Dict[str, Any], parent_key: str = "") -> Dict[str, Any]:
+        """检查并修复输出中的数值问题"""
+        def process_dict(d: Dict[str, Any], current_key: str = "") -> Dict[str, Any]:
+            for key, value in d.items():
+                full_key = f"{current_key}.{key}" if current_key else key
+                if isinstance(value, dict):
+                    d[key] = process_dict(value, full_key)
+                else:
+                    d[key] = NumericsHandler.fix_numerics(value, full_key)
+            return d
+        
+        return process_dict(result, parent_key)
+
+
 class ModelRunner:
     """添加缓存机制的ModelRunner"""
     def __init__(
@@ -446,6 +503,11 @@ class ModelRunner:
         self._model_dir = model_dir
         self._cache_manager = CacheManager()
         self._param_cache = {}
+        self._numerics_handler = NumericsHandler()
+        
+        # 设置JAX优化选项
+        jax.config.update('jax_enable_x64', False)  # 使用float32
+        jax.config.update('jax_default_matmul_precision', 'bfloat16')
     
     @functools.lru_cache(maxsize=32)
     def _get_cached_params(self, param_key: str):
@@ -473,7 +535,7 @@ class ModelRunner:
         featurised_example: features.BatchDict,
         rng_key: jnp.ndarray,
     ) -> model.ModelResult:
-        """运行推理，添加结果缓存"""
+        """运行推理，添加数值检查"""
         cache_key = self._cache_manager._get_cache_key(
             featurised_example,
             rng_key,
@@ -495,22 +557,28 @@ class ModelRunner:
         )
 
         result = self._model(rng_key, featurised_example)
-        result = self.check_output_numerics(result)
+        
+        # 检查并修复数值问题
+        result = self._numerics_handler.check_output_numerics(result)
+        
+        # 转换数据类型
         result = jax.tree.map(np.asarray, result)
         result = jax.tree.map(
             lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x,
             result,
         )
+        
+        # 添加标识符
         result = dict(result)
         identifier = self._get_cached_params('')['__meta__']['__identifier__'].tobytes()
         result['__identifier__'] = identifier
         
-        # 最后再次检查关键坐标数据
+        # 最后检查关键坐标数据
         if 'structure_module' in result:
             for key in ['final_atom_positions', 'final_atom_mask']:
                 if key in result['structure_module']:
-                    result['structure_module'][key] = self.fix_numerics(
-                        result['structure_module'][key], 
+                    result['structure_module'][key] = self._numerics_handler.fix_numerics(
+                        result['structure_module'][key],
                         f'structure_module.{key}'
                     )
         
@@ -518,50 +586,6 @@ class ModelRunner:
         self._cache_manager.put(cache_key, result)
         
         return result
-
-    @staticmethod
-    def fix_numerics(value, key=""):
-        """修复数值问题的通用方法"""
-        if isinstance(value, (np.ndarray, jnp.ndarray)):
-          if np.any(np.isnan(value)) or np.any(np.isinf(value)):
-            print(f"Warning: Found NaN/inf in output {key}")
-            print(f"Shape: {value.shape}")
-            print(f"NaN count: {np.isnan(value).sum()}")
-            print(f"Inf count: {np.isinf(value).sum()}")
-            
-            # 对于坐标相关的键，使用更保守的替换值
-            if any(coord in key.lower() for coord in ['coord', 'pos', 'xyz', 'position']):
-              # 使用邻近的有效值填充
-              mask = np.isnan(value) | np.isinf(value)
-              if mask.any():
-                valid_values = value[~mask]
-                if len(valid_values) > 0:
-                  # 使用有效值的平均值
-                  fill_value = np.mean(valid_values)
-                else:
-                  # 如果没有有效值，使用0
-                  fill_value = 0.0
-                value = np.where(mask, fill_value, value)
-            else:
-              # 对于其他值使用标准替换
-              value = np.nan_to_num(value, nan=0.0, posinf=1e6, neginf=-1e6)
-          
-          # 确保数值在合理范围内
-          value = np.clip(value, -1e6, 1e6)
-        return value
-
-    def check_output_numerics(self, result):
-        """检查并修复输出中的数值问题"""
-        def process_dict(d, parent_key=""):
-          for key, value in d.items():
-            full_key = f"{parent_key}.{key}" if parent_key else key
-            if isinstance(value, dict):
-              d[key] = process_dict(value, full_key)
-            else:
-              d[key] = self.fix_numerics(value, full_key)
-          return d
-
-        return process_dict(result)
 
     def extract_structures(
         self,
