@@ -1007,7 +1007,7 @@ def split_sequence(fold_input: folding_input.Input, segment_size: int = 50, min_
     """将单个序列分割成固定长度的片段，过小的末尾片段会合并到前一个片段"""
     split_inputs = []
     
-    for chain in fold_input.chains:
+    for i, chain in enumerate(fold_input.chains):
         sequence = chain.sequence
         # 计算完整片段数和剩余长度
         num_full_segments = len(sequence) // segment_size
@@ -1021,18 +1021,23 @@ def split_sequence(fold_input: folding_input.Input, segment_size: int = 50, min_
             last_segment_size = remainder
         
         # 创建完整的片段
-        for i in range(num_full_segments):
-            start = i * segment_size
-            end = (i + 1) * segment_size
+        for j in range(num_full_segments):
+            start = j * segment_size
+            end = (j + 1) * segment_size
             
-            # 创建新的fold_input，直接使用字典构造
-            split_name = f"{fold_input.name}_segment_{i+1}"
+            # 创建新的chain
+            chain_id = f"chain_{i}_segment_{j+1}"
+            chain_dict = {
+                'id': chain_id,
+                'sequence': sequence[start:end],
+                'description': f"segment_{j+1}"
+            }
+            
+            # 创建新的fold_input
+            split_name = f"{fold_input.name}_segment_{j+1}"
             split_input = folding_input.Input(
                 name=split_name,
-                chains=[{
-                    'sequence': sequence[start:end],
-                    'description': f"segment_{i+1}"
-                }],
+                chains=[chain_dict],
                 rng_seeds=fold_input.rng_seeds,
             )
             
@@ -1043,13 +1048,17 @@ def split_sequence(fold_input: folding_input.Input, segment_size: int = 50, min_
             start = num_full_segments * segment_size
             end = len(sequence)
             
+            chain_id = f"chain_{i}_segment_{num_full_segments+1}"
+            chain_dict = {
+                'id': chain_id,
+                'sequence': sequence[start:end],
+                'description': f"segment_{num_full_segments+1}"
+            }
+            
             split_name = f"{fold_input.name}_segment_{num_full_segments+1}"
             split_input = folding_input.Input(
                 name=split_name,
-                chains=[{
-                    'sequence': sequence[start:end],
-                    'description': f"segment_{num_full_segments+1}"
-                }],
+                chains=[chain_dict],
                 rng_seeds=fold_input.rng_seeds,
             )
             
