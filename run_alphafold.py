@@ -1097,69 +1097,110 @@ def process_chunk(
 
 def split_features(features: features.BatchDict, target_size: int) -> List[features.BatchDict]:
     """将大型特征分割成更小的块"""
-    # 获取序列长度
-    if isinstance(features['seq_length'], np.ndarray):
-        seq_length = features['seq_length'][0]
-    else:
-        seq_length = features['seq_length']
-    
-    # 打印特征的结构，帮助调试
-    print("\n特征结构:")
+    # 首先打印特征的完整结构
+    print("\n完整特征结构:")
     for key, value in features.items():
-        if isinstance(value, np.ndarray):
-            print(f"{key}: shape={value.shape}, dtype={value.dtype}")
-        else:
-            print(f"{key}: type={type(value)}")
+        print(f"\nKey: {key}")
+        print(f"Type: {type(value)}")
+        if isinstance(value, (list, tuple)):
+            print(f"Length: {len(value)}")
+            if value:
+                print(f"First element type: {type(value[0])}")
+                if isinstance(value[0], np.ndarray):
+                    print(f"First element shape: {value[0].shape}")
+        elif isinstance(value, np.ndarray):
+            print(f"Shape: {value.shape}")
+            print(f"Dtype: {value.dtype}")
+        elif isinstance(value, dict):
+            print("Dictionary contents:")
+            for k, v in value.items():
+                print(f"  {k}: {type(v)}")
     
-    # 计算需要分成几个块
-    feature_size = sum(
-        f.nbytes for f in jax.tree_util.tree_leaves(features)
-        if isinstance(f, (np.ndarray, jnp.ndarray))
-    )
-    num_splits = max(1, int(np.ceil(feature_size / target_size)))
+    # 获取序列长度
+    try:
+        if isinstance(features['seq_length'], list):
+            seq_length = features['seq_length'][0]
+            if isinstance(seq_length, np.ndarray):
+                seq_length = seq_length[0]
+        elif isinstance(features['seq_length'], np.ndarray):
+            seq_length = features['seq_length'][0]
+        else:
+            seq_length = features['seq_length']
+        
+        print(f"\n序列长度: {seq_length}")
+    except Exception as e:
+        print(f"获取序列长度时出错: {e}")
+        print(f"seq_length的实际值: {features['seq_length']}")
+        raise
+    
+    # 计算特征大小
+    feature_size = 0
+    for key, value in features.items():
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, np.ndarray):
+                    feature_size += item.nbytes
+        elif isinstance(value, np.ndarray):
+            feature_size += value.nbytes
     
     print(f"\n特征总大小: {feature_size / (1024 * 1024):.2f} MB")
+    
+    # 计算分割数量
+    num_splits = max(1, int(np.ceil(feature_size / target_size)))
     print(f"分割数量: {num_splits}")
     
-    # 计算每个块的序列长度
+    # 计算每个块的大小
     split_size = int(np.ceil(seq_length / num_splits))
     print(f"每块大小: {split_size}")
     
+    # 进行分割
     split_features = []
     for i in range(num_splits):
         start_idx = i * split_size
         end_idx = min((i + 1) * split_size, seq_length)
         
+        print(f"\n创建分片 {i+1}/{num_splits} ({start_idx}:{end_idx})")
+        
         # 创建新的特征字典
         split_dict = {}
         for key, value in features.items():
-            if isinstance(value, np.ndarray):
-                # 检查数组的形状
-                if len(value.shape) == 0:
-                    # 标量数组
-                    split_dict[key] = value
-                elif value.shape[0] == seq_length:
-                    # 第一维是序列长度
-                    split_dict[key] = value[start_idx:end_idx]
-                elif len(value.shape) > 1 and value.shape[1] == seq_length:
-                    # 第二维是序列长度
-                    split_dict[key] = value[:, start_idx:end_idx]
+            try:
+                if isinstance(value, list):
+                    # 处理列表类型的特征
+                    split_dict[key] = [
+                        item[start_idx:end_idx] if isinstance(item, np.ndarray) and item.shape[0] == seq_length
+                        else item[:, start_idx:end_idx] if isinstance(item, np.ndarray) and len(item.shape) > 1 and item.shape[1] == seq_length
+                        else item
+                        for item in value
+                    ]
+                elif isinstance(value, np.ndarray):
+                    # 处理numpy数组
+                    if len(value.shape) == 0:
+                        split_dict[key] = value
+                    elif value.shape[0] == seq_length:
+                        split_dict[key] = value[start_idx:end_idx]
+                    elif len(value.shape) > 1 and value.shape[1] == seq_length:
+                        split_dict[key] = value[:, start_idx:end_idx]
+                    else:
+                        split_dict[key] = value
                 else:
-                    # 其他情况，保持原样
+                    # 其他类型直接复制
                     split_dict[key] = value
-            else:
-                # 非数组类型，直接复制
-                split_dict[key] = value
+            except Exception as e:
+                print(f"处理特征 {key} 时出错: {e}")
+                print(f"特征值类型: {type(value)}")
+                if isinstance(value, (list, np.ndarray)):
+                    print(f"特征值形状/长度: {len(value) if isinstance(value, list) else value.shape}")
+                raise
         
         # 更新序列长度
-        if isinstance(features['seq_length'], np.ndarray):
-            split_dict['seq_length'] = np.array([end_idx - start_idx], dtype=np.int32)
+        if isinstance(features['seq_length'], list):
+            split_dict['seq_length'] = [np.array([end_idx - start_idx], dtype=np.int32)]
         else:
-            split_dict['seq_length'] = end_idx - start_idx
+            split_dict['seq_length'] = np.array([end_idx - start_idx], dtype=np.int32)
         
         split_features.append(split_dict)
-        
-        print(f"分片 {i+1}: {start_idx}-{end_idx}, 长度={end_idx-start_idx}")
+        print(f"分片 {i+1} 创建完成")
     
     return split_features
 
