@@ -571,11 +571,13 @@ def create_model_runner(model_config, model_dir):
     jax.config.update('jax_enable_x64', False)  # 使用float32以提高性能
     jax.config.update('jax_default_matmul_precision', 'bfloat16')  # 使用bfloat16加速矩阵运算
     
+    # 禁用ROCM和TPU检查
+    os.environ['JAX_PLATFORMS'] = 'cpu'  # 强制使用CPU平台
+    os.environ['JAX_SKIP_ROCM_TESTS'] = '1'  # 跳过ROCM测试
+    os.environ['JAX_SKIP_TPU_TESTS'] = '1'   # 跳过TPU测试
+    
     # 设置CPU线程数
     num_physical_cores = psutil.cpu_count(logical=False)  # 物理核心数
-    threads_per_core = 2  # 每个核心的线程数
-    
-    # 为每个进程分配合适的线程数
     process_threads = max(1, num_physical_cores // 2)
     
     # 设置线程亲和性和线程数
@@ -583,6 +585,7 @@ def create_model_runner(model_config, model_dir):
     os.environ['MKL_NUM_THREADS'] = str(process_threads)
     os.environ['OPENBLAS_NUM_THREADS'] = str(process_threads)
     os.environ['VECLIB_MAXIMUM_THREADS'] = str(process_threads)
+    os.environ['NUMEXPR_NUM_THREADS'] = str(process_threads)
     
     # 启用Intel MKL优化
     os.environ['MKL_DEBUG_CPU_TYPE'] = '5'  # 启用高级指令集
@@ -1132,6 +1135,10 @@ def main(_):
     data_pipeline_config = None
 
   if _RUN_INFERENCE.value:
+    # 禁用GPU/TPU相关检查
+    if _GPU_DEVICE.value is not None:
+        print("Warning: GPU device selection is ignored in CPU-only mode")
+    
     # 创建模型配置
     model_config = make_model_config(
         flash_attention_implementation='xla',  # CPU只支持XLA实现
