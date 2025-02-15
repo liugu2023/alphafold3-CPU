@@ -42,7 +42,7 @@ import string
 import textwrap
 import time
 import typing
-from typing import overload, Dict, Any, Tuple, Optional
+from typing import overload, Dict, Any, Tuple, Optional, List
 from concurrent.futures import ProcessPoolExecutor
 import psutil
 import gc
@@ -598,7 +598,7 @@ class MemoryManager:
 
 
 class ModelRunner:
-    """添加缓存机制的ModelRunner"""
+    """支持多CPU的ModelRunner"""
     def __init__(
         self,
         config: model.Model.Config,
@@ -606,6 +606,8 @@ class ModelRunner:
         model_dir: pathlib.Path,
     ):
         self._model_config = config
+        self._devices = jax.local_devices(backend='cpu')[:2]  # 使用前两个CPU
+        print(f"Using CPU devices: {self._devices}")
         self._device = device
         self._model_dir = model_dir
         self._cache_manager = CacheManager()
@@ -613,10 +615,138 @@ class ModelRunner:
         self._numerics_handler = NumericsHandler()
         self._memory_manager = MemoryManager()
         
-        # 设置JAX优化选项
+        # CPU优化设置
+        num_physical_cores = psutil.cpu_count(logical=False)
+        threads_per_cpu = max(1, num_physical_cores // 2)  # 每个CPU使用一半的物理核心
+        
+        # 设置线程数
+        os.environ['OMP_NUM_THREADS'] = str(threads_per_cpu)
+        os.environ['MKL_NUM_THREADS'] = str(threads_per_cpu)
+        os.environ['OPENBLAS_NUM_THREADS'] = str(threads_per_cpu)
+        os.environ['VECLIB_MAXIMUM_THREADS'] = str(threads_per_cpu)
+        os.environ['NUMEXPR_NUM_THREADS'] = str(threads_per_cpu)
+        
+        # 设置CPU亲和性
+        os.environ['OMP_PLACES'] = 'cores'
+        os.environ['OMP_PROC_BIND'] = 'close'
+        
+        print(f"Threads per CPU: {threads_per_cpu}")
+        
+        # JAX优化选项
         jax.config.update('jax_enable_x64', False)
         jax.config.update('jax_default_matmul_precision', 'bfloat16')
     
+    def _split_batch(self, batch: features.BatchDict) -> List[features.BatchDict]:
+        """将批处理数据分成两部分"""
+        # 根据数据大小或特征数量进行分割
+        if isinstance(batch, dict):
+            mid = len(next(iter(batch.values()))) // 2
+            batch1 = {k: v[:mid] for k, v in batch.items()}
+            batch2 = {k: v[mid:] for k, v in batch.items()}
+            return [batch1, batch2]
+        return [batch]  # 如果无法分割则返回原始批次
+    
+    def run_inference(
+        self,
+        featurised_example: features.BatchDict,
+        rng_key: jnp.ndarray,
+    ) -> model.ModelResult:
+        """使用多CPU运行推理"""
+        with self._memory_manager.monitor("Model Inference"):
+            # 检查缓存
+            cache_key = self._cache_manager._get_cache_key(
+                featurised_example,
+                rng_key,
+                self._model_config
+            )
+            
+            cached_result = self._cache_manager.get(cache_key)
+            if cached_result is not None:
+                print("Using cached result")
+                return cached_result
+            
+            # 主动清理内存
+            self._memory_manager.cleanup()
+            
+            # 分割数据
+            batches = self._split_batch(featurised_example)
+            
+            # 在不同CPU上并行处理
+            results = []
+            for i, (batch, device) in enumerate(zip(batches, self._devices)):
+                with self._memory_manager.monitor(f"CPU{i} Processing"):
+                    # 将数据放到对应的设备上
+                    batch = jax.device_put(
+                        jax.tree_util.tree_map(
+                            jnp.asarray,
+                            utils.remove_invalidly_typed_feats(batch)
+                        ),
+                        device
+                    )
+                    
+                    # 使用对应设备的模型进行计算
+                    sub_result = self._model(rng_key, batch)
+                    results.append(sub_result)
+            
+            # 合并结果
+            result = self._merge_results(results)
+            
+            # 检查并修复数值问题
+            result = self._numerics_handler.check_output_numerics(result)
+            
+            # 数据类型转换和后处理
+            result = self._post_process_result(result)
+            
+            # 缓存结果前清理内存
+            self._memory_manager.cleanup()
+            
+            # 缓存结果
+            self._cache_manager.put(cache_key, result)
+            
+            return result
+    
+    def _merge_results(self, results: List[model.ModelResult]) -> model.ModelResult:
+        """合并多个CPU的计算结果"""
+        if len(results) == 1:
+            return results[0]
+        
+        # 合并字典类型的结果
+        merged = {}
+        for key in results[0].keys():
+            if isinstance(results[0][key], np.ndarray):
+                merged[key] = np.concatenate([r[key] for r in results])
+            elif isinstance(results[0][key], dict):
+                merged[key] = self._merge_results([r[key] for r in results])
+            else:
+                merged[key] = results[0][key]
+        
+        return merged
+    
+    def _post_process_result(self, result: model.ModelResult) -> model.ModelResult:
+        """结果后处理"""
+        # 转换数据类型
+        result = jax.tree.map(np.asarray, result)
+        result = jax.tree.map(
+            lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x,
+            result,
+        )
+        
+        # 添加标识符
+        result = dict(result)
+        identifier = self._get_cached_params('')['__meta__']['__identifier__'].tobytes()
+        result['__identifier__'] = identifier
+        
+        # 检查关键坐标数据
+        if 'structure_module' in result:
+            for key in ['final_atom_positions', 'final_atom_mask']:
+                if key in result['structure_module']:
+                    result['structure_module'][key] = self._numerics_handler.fix_numerics(
+                        result['structure_module'][key],
+                        f'structure_module.{key}'
+                    )
+        
+        return result
+
     @functools.lru_cache(maxsize=32)
     def _get_cached_params(self, param_key: str):
         """缓存模型参数"""
@@ -637,71 +767,6 @@ class ModelRunner:
             jax.jit(forward_fn.apply, device=self._device), 
             self._get_cached_params('')
         )
-    
-    def run_inference(
-        self,
-        featurised_example: features.BatchDict,
-        rng_key: jnp.ndarray,
-    ) -> model.ModelResult:
-        """运行推理，添加内存监控"""
-        with self._memory_manager.monitor("Model Inference"):
-            # 检查缓存
-            cache_key = self._cache_manager._get_cache_key(
-                featurised_example,
-                rng_key,
-                self._model_config
-            )
-            
-            cached_result = self._cache_manager.get(cache_key)
-            if cached_result is not None:
-                print("Using cached result")
-                return cached_result
-            
-            # 主动清理内存
-            self._memory_manager.cleanup()
-            
-            # 计算新结果
-            featurised_example = jax.device_put(
-                jax.tree_util.tree_map(
-                    jnp.asarray,
-                    utils.remove_invalidly_typed_feats(featurised_example)
-                ),
-                self._device,
-            )
-            
-            result = self._model(rng_key, featurised_example)
-            
-            # 检查并修复数值问题
-            result = self._numerics_handler.check_output_numerics(result)
-            
-            # 转换数据类型
-            result = jax.tree.map(np.asarray, result)
-            result = jax.tree.map(
-                lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x,
-                result,
-            )
-            
-            # 添加标识符
-            result = dict(result)
-            identifier = self._get_cached_params('')['__meta__']['__identifier__'].tobytes()
-            result['__identifier__'] = identifier
-            
-            # 最后检查关键坐标数据
-            if 'structure_module' in result:
-                for key in ['final_atom_positions', 'final_atom_mask']:
-                    if key in result['structure_module']:
-                        result['structure_module'][key] = self._numerics_handler.fix_numerics(
-                            result['structure_module'][key],
-                            f'structure_module.{key}'
-                        )
-            
-            # 缓存结果前清理内存
-            self._memory_manager.cleanup()
-            
-            # 缓存结果
-            self._cache_manager.put(cache_key, result)
-            
-            return result
 
     def extract_structures(
         self,
