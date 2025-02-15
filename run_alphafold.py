@@ -655,14 +655,46 @@ class ModelRunner:
         jax.config.update('jax_default_matmul_precision', 'bfloat16')
     
     def _split_batch(self, batch: features.BatchDict) -> List[features.BatchDict]:
-        """将批处理数据分成两部分"""
-        # 根据数据大小或特征数量进行分割
-        if isinstance(batch, dict):
-            mid = len(next(iter(batch.values()))) // 2
-            batch1 = {k: v[:mid] for k, v in batch.items()}
-            batch2 = {k: v[mid:] for k, v in batch.items()}
-            return [batch1, batch2]
-        return [batch]  # 如果无法分割则返回原始批次
+        """将批处理数据分成两部分，安全处理不同维度的数据"""
+        if not isinstance(batch, dict):
+            return [batch]  # 如果不是字典类型，直接返回原始数据
+        
+        # 找到可分割的第一个数组
+        splittable_arrays = []
+        for k, v in batch.items():
+            if isinstance(v, (np.ndarray, jnp.ndarray)) and v.ndim > 0:
+                splittable_arrays.append((k, len(v)))
+        
+        if not splittable_arrays:
+            return [batch]  # 如果没有可分割的数组，返回原始批次
+        
+        # 使用第一个可分割数组的长度作为分割点
+        _, first_length = splittable_arrays[0]
+        mid = first_length // 2
+        
+        # 分割数据
+        batch1 = {}
+        batch2 = {}
+        for k, v in batch.items():
+            if isinstance(v, (np.ndarray, jnp.ndarray)):
+                if v.ndim > 0 and len(v) == first_length:
+                    # 可分割的数组
+                    batch1[k] = v[:mid]
+                    batch2[k] = v[mid:]
+                else:
+                    # 0维数组或长度不匹配的数组
+                    batch1[k] = v
+                    batch2[k] = v
+            else:
+                # 非数组类型的数据
+                batch1[k] = v
+                batch2[k] = v
+        
+        # 如果只有一个设备，或者数据无法分割，返回单个批次
+        if len(self._devices) == 1 or not splittable_arrays:
+            return [batch]
+        
+        return [batch1, batch2]
     
     def run_inference(
         self,
@@ -688,6 +720,7 @@ class ModelRunner:
             
             # 分割数据
             batches = self._split_batch(featurised_example)
+            print(f"Split into {len(batches)} batches")
             
             # 在不同CPU上并行处理
             results = []
@@ -707,7 +740,11 @@ class ModelRunner:
                     results.append(sub_result)
             
             # 合并结果
-            result = self._merge_results(results)
+            if len(results) > 1:
+                print("Merging results from multiple CPUs")
+                result = self._merge_results(results)
+            else:
+                result = results[0]
             
             # 检查并修复数值问题
             result = self._numerics_handler.check_output_numerics(result)
