@@ -1119,7 +1119,7 @@ def analyze_and_split_features(
     fold_inputs: List[folding_input.Input],
     data_pipeline_config: pipeline.DataPipelineConfig | None,
     buckets: Sequence[int] | None = None,
-    chunk_size: int = 40,
+    target_chunk_size_mb: float = 10.0,  # 目标分片大小，单位MB
 ) -> Tuple[List[List[Tuple[folding_input.Input, features.BatchDict]]], Dict]:
     """特征化并分析输入数据，然后进行分割"""
     
@@ -1173,11 +1173,11 @@ def analyze_and_split_features(
     print(f"最大特征大小: {stats['max_size_mb']:.2f} MB")
     print(f"特征大小标准差: {stats['std_size_mb']:.2f} MB")
     
-    # 根据特征大小进行分割
+    # 根据固定大小进行分割
+    target_chunk_size = target_chunk_size_mb * 1024 * 1024  # 转换为字节
     chunks = []
     current_chunk = []
     current_chunk_size = 0
-    target_chunk_size = total_size / (len(fold_inputs) / chunk_size)
     
     for fold_input, features in all_features:
         feature_size = sum(
@@ -1185,6 +1185,16 @@ def analyze_and_split_features(
             if isinstance(f, (np.ndarray, jnp.ndarray))
         )
         
+        # 如果单个特征大于目标大小，单独作为一个分片
+        if feature_size > target_chunk_size:
+            if current_chunk:
+                chunks.append(current_chunk)
+                current_chunk = []
+                current_chunk_size = 0
+            chunks.append([(fold_input, features)])
+            continue
+        
+        # 如果当前分片加上新特征会超过目标大小，创建新分片
         if current_chunk_size + feature_size > target_chunk_size and current_chunk:
             chunks.append(current_chunk)
             current_chunk = []
@@ -1193,6 +1203,7 @@ def analyze_and_split_features(
         current_chunk.append((fold_input, features))
         current_chunk_size += feature_size
     
+    # 添加最后一个分片
     if current_chunk:
         chunks.append(current_chunk)
     
@@ -1206,6 +1217,10 @@ def analyze_and_split_features(
         )
         print(f"分片 {i+1}: {len(chunk)} 个输入, "
               f"大小 {chunk_size / (1024 * 1024):.2f} MB")
+        
+        # 打印该分片中的输入名称
+        input_names = [fold_input.name for fold_input, _ in chunk]
+        print(f"包含输入: {', '.join(input_names)}")
     
     return chunks, stats
 
@@ -1316,12 +1331,12 @@ def main(_):
         model_config = None
         model_dir = None
 
-    # 特征化和分析
+    # 特征化和分析，使用10MB作为目标分片大小
     chunks, stats = analyze_and_split_features(
         fold_inputs=fold_inputs,
         data_pipeline_config=data_pipeline_config,
         buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
-        chunk_size=40
+        target_chunk_size_mb=10.0
     )
     
     print("\n是否继续处理? (y/n)")
