@@ -315,90 +315,103 @@ class CacheManager:
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         self._hits = 0
         self._misses = 0
+        
+    def _serialize_value(self, value: Any) -> Any:
+        """序列化值以便存储"""
+        if isinstance(value, np.ndarray):
+            # 处理包含NaN/Inf的数组
+            if np.any(np.isnan(value)) or np.any(np.isinf(value)):
+                # 使用掩码数组保存无效值的位置
+                mask = np.isnan(value) | np.isinf(value)
+                cleaned_value = np.where(mask, 0, value)
+                return {
+                    'type': 'ndarray_with_invalid',
+                    'data': cleaned_value,
+                    'mask': mask,
+                    'shape': value.shape,
+                    'dtype': str(value.dtype)
+                }
+            return {
+                'type': 'ndarray',
+                'data': value,
+                'shape': value.shape,
+                'dtype': str(value.dtype)
+            }
+        elif isinstance(value, dict):
+            return {
+                'type': 'dict',
+                'data': {k: self._serialize_value(v) for k, v in value.items()}
+            }
+        elif isinstance(value, (list, tuple)):
+            return {
+                'type': 'sequence',
+                'data': [self._serialize_value(item) for item in value],
+                'sequence_type': type(value).__name__
+            }
+        elif isinstance(value, bytes):
+            return {
+                'type': 'bytes',
+                'data': value.hex()
+            }
+        return value
     
-    def _get_cache_key(self, *args, **kwargs) -> str:
-        """生成缓存键"""
-        def make_hashable(obj):
-            if isinstance(obj, np.ndarray):
-                # 对于numpy数组，使用其形状和内容的哈希值
-                return f"array_shape={obj.shape}_hash={hash(obj.tobytes())}"
-            if isinstance(obj, (dict, list, set)):
-                # 递归处理嵌套结构
-                if isinstance(obj, dict):
-                    return f"dict_{hash(tuple((k, make_hashable(v)) for k, v in sorted(obj.items())))}"
-                return f"{type(obj).__name__}_{hash(tuple(make_hashable(x) for x in obj))}"
-            if hasattr(obj, '__dict__'):
-                # 处理自定义对象
-                return f"{obj.__class__.__name__}_{hash(str(obj.__dict__))}"
-            return str(obj)
-        
-        # 组合所有参数的哈希值
-        key_parts = []
-        for arg in args:
+    def _deserialize_value(self, value: Any) -> Any:
+        """反序列化存储的值"""
+        if isinstance(value, dict) and 'type' in value:
+            if value['type'] == 'ndarray':
+                return np.array(value['data'], dtype=np.dtype(value['dtype']))
+            elif value['type'] == 'ndarray_with_invalid':
+                result = np.array(value['data'], dtype=np.dtype(value['dtype']))
+                mask = value['mask']
+                result[mask] = np.nan  # 恢复NaN值
+                return result
+            elif value['type'] == 'dict':
+                return {k: self._deserialize_value(v) for k, v in value['data'].items()}
+            elif value['type'] == 'sequence':
+                items = [self._deserialize_value(item) for item in value['data']]
+                return tuple(items) if value['sequence_type'] == 'tuple' else items
+            elif value['type'] == 'bytes':
+                return bytes.fromhex(value['data'])
+        return value
+    
+    def put(self, key: str, value: Any) -> None:
+        """存储结果到缓存"""
+        try:
+            # 序列化并存储到内存缓存
+            serialized_value = self._serialize_value(value)
+            self._memory_cache[key] = serialized_value
+            
+            # 存储到磁盘缓存
+            cache_file = self._cache_dir / f"{key}.npz"
             try:
-                key_parts.append(make_hashable(arg))
+                np.savez_compressed(cache_file, data=serialized_value)
             except Exception as e:
-                print(f"Warning: Failed to hash argument {type(arg)}: {e}")
-                key_parts.append(f"unhashable_{type(arg).__name__}")
-        
-        for k, v in sorted(kwargs.items()):
-            try:
-                key_parts.append(f"{k}={make_hashable(v)}")
-            except Exception as e:
-                print(f"Warning: Failed to hash kwarg {k}: {e}")
-                key_parts.append(f"{k}=unhashable_{type(v).__name__}")
-        
-        # 生成最终的哈希值
-        combined = "_".join(key_parts)
-        return hashlib.sha256(combined.encode()).hexdigest()
+                print(f"Warning: Failed to save to disk cache: {e}")
+                
+        except Exception as e:
+            print(f"Warning: Failed to cache value: {e}")
     
     def get(self, key: str) -> Optional[Any]:
         """获取缓存的结果"""
         # 先检查内存缓存
         if key in self._memory_cache:
             self._hits += 1
-            return self._memory_cache[key]
+            return self._deserialize_value(self._memory_cache[key])
         
         # 检查磁盘缓存
         cache_file = self._cache_dir / f"{key}.npz"
         if cache_file.exists():
-            self._hits += 1
             try:
                 with np.load(cache_file, allow_pickle=True) as data:
-                    result = {k: data[k] for k in data.files}
-                    self._memory_cache[key] = result
-                    return result
+                    value = data['data'].item()
+                    self._memory_cache[key] = value  # 加载到内存缓存
+                    self._hits += 1
+                    return self._deserialize_value(value)
             except Exception as e:
-                print(f"Failed to load cache: {e}")
+                print(f"Warning: Failed to load from disk cache: {e}")
         
         self._misses += 1
         return None
-    
-    def put(self, key: str, value: Any):
-        """存储结果到缓存"""
-        try:
-            self._memory_cache[key] = value
-            cache_file = self._cache_dir / f"{key}.npz"
-            
-            # 确保值是可以被npz存储的格式
-            save_dict = {}
-            for k, v in value.items():
-                if isinstance(v, np.ndarray):
-                    save_dict[k] = v
-                elif isinstance(v, (int, float, bool, str)):
-                    save_dict[k] = np.array([v])
-                else:
-                    print(f"Warning: Skipping non-serializable value for key {k}")
-            
-            if save_dict:
-                np.savez_compressed(cache_file, **save_dict)
-            
-        except Exception as e:
-            print(f"Failed to save cache: {e}")
-    
-    def get_stats(self) -> Tuple[int, int]:
-        """返回缓存命中和未命中次数"""
-        return self._hits, self._misses
 
 
 class Timer:
