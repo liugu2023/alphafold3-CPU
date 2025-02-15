@@ -32,7 +32,7 @@ import string
 import textwrap
 import time
 import typing
-from typing import overload, Dict, Any, Tuple, Optional, List
+from typing import overload, Dict, Any, Tuple, Optional
 from concurrent.futures import ProcessPoolExecutor
 import psutil
 import gc
@@ -219,6 +219,11 @@ _JAX_COMPILATION_CACHE_DIR = flags.DEFINE_string(
     None,
     'Path to a directory for the JAX compilation cache.',
 )
+_GPU_DEVICE = flags.DEFINE_integer(
+    'gpu_device',
+    None,  # 改为None默认值
+    'Deprecated: GPU device selection is not supported in CPU-only mode.',
+)
 _BUCKETS = flags.DEFINE_list(
     'buckets',
     # pyformat: disable
@@ -228,6 +233,19 @@ _BUCKETS = flags.DEFINE_list(
     'Strictly increasing order of token sizes for which to cache compilations.'
     ' For any input with more tokens than the largest bucket size, a new bucket'
     ' is created for exactly that number of tokens.',
+)
+_FLASH_ATTENTION_IMPLEMENTATION = flags.DEFINE_enum(
+    'flash_attention_implementation',
+    default='triton',
+    enum_values=['triton', 'cudnn', 'xla'],
+    help=(
+        "Flash attention implementation to use. 'triton' and 'cudnn' uses a"
+        ' Triton and cuDNN flash attention implementation, respectively. The'
+        ' Triton kernel is fastest and has been tested more thoroughly. The'
+        " Triton and cuDNN kernels require Ampere GPUs or later. 'xla' uses an"
+        ' XLA attention implementation (no flash attention) and is portable'
+        ' across GPU devices.'
+    ),
 )
 _NUM_RECYCLES = flags.DEFINE_integer(
     'num_recycles',
@@ -548,16 +566,49 @@ class ResultsForSeed:
 
 
 def create_model_runner(model_config, model_dir):
-    """在每个进程中创建ModelRunner"""
+    """在每个进程中创建ModelRunner，添加计算优化"""
+    # 设置JAX优化选项
+    jax.config.update('jax_enable_x64', False)  # 使用float32以提高性能
+    jax.config.update('jax_default_matmul_precision', 'bfloat16')  # 使用bfloat16加速矩阵运算
+    
+    # 设置CPU线程数
+    num_physical_cores = psutil.cpu_count(logical=False)  # 物理核心数
+    threads_per_core = 2  # 每个核心的线程数
+    
+    # 为每个进程分配合适的线程数
+    process_threads = max(1, num_physical_cores // 2)
+    
+    # 设置线程亲和性和线程数
+    os.environ['OMP_NUM_THREADS'] = str(process_threads)
+    os.environ['MKL_NUM_THREADS'] = str(process_threads)
+    os.environ['OPENBLAS_NUM_THREADS'] = str(process_threads)
+    os.environ['VECLIB_MAXIMUM_THREADS'] = str(process_threads)
+    
+    # 启用Intel MKL优化
+    os.environ['MKL_DEBUG_CPU_TYPE'] = '5'  # 启用高级指令集
+    os.environ['MKL_ENABLE_INSTRUCTIONS'] = 'AVX2'  # 使用AVX2指令集
+    
+    # 设置CPU亲和性策略
+    os.environ['KMP_AFFINITY'] = 'granularity=fine,compact,1,0'
+    
+    # 优化内存分配
+    os.environ['MKL_DYNAMIC'] = 'FALSE'  # 禁用动态调整以提高稳定性
+    
+    print(f"Optimized thread settings:")
+    print(f"Physical cores: {num_physical_cores}")
+    print(f"Threads per process: {process_threads}")
+    
     # 使用CPU设备
     devices = jax.local_devices(backend='cpu')
     print(f'Creating model runner with CPU device: {devices[0]}')
     
+    # 创建优化后的ModelRunner
     model_runner = ModelRunner(
         config=model_config,
         device=devices[0],
         model_dir=model_dir,
     )
+    
     return model_runner
 
 
@@ -1003,322 +1054,120 @@ def process_fold_input(
     return output
 
 
-def split_sequence(fold_input: folding_input.Input, segment_size: int = 50, min_segment_size: int = 10) -> List[folding_input.Input]:
-    """将单个序列分割成固定长度的片段，过小的末尾片段会合并到前一个片段"""
-    split_inputs = []
-    
-    for i, chain in enumerate(fold_input.chains):
-        sequence = chain.sequence
-        # 计算完整片段数和剩余长度
-        num_full_segments = len(sequence) // segment_size
-        remainder = len(sequence) % segment_size
-        
-        # 如果剩余部分太小，调整最后一个完整片段的大小
-        if remainder > 0 and remainder < min_segment_size:
-            num_full_segments -= 1
-            last_segment_size = segment_size + remainder
-        else:
-            last_segment_size = remainder
-        
-        # 创建完整的片段
-        for j in range(num_full_segments):
-            start = j * segment_size
-            end = (j + 1) * segment_size
-            
-            # 创建新的chain
-            chain_id = f"chain_{i}_segment_{j+1}"
-            chain_dict = {
-                'id': chain_id,
-                'sequence': sequence[start:end],
-                'description': f"segment_{j+1}"
-            }
-            
-            # 创建新的fold_input
-            split_name = f"{fold_input.name}_segment_{j+1}"
-            split_input = folding_input.Input(
-                name=split_name,
-                chains=[chain_dict],
-                rng_seeds=fold_input.rng_seeds,
-            )
-            
-            split_inputs.append(split_input)
-        
-        # 处理最后一个片段（如果有）
-        if num_full_segments * segment_size < len(sequence):
-            start = num_full_segments * segment_size
-            end = len(sequence)
-            
-            chain_id = f"chain_{i}_segment_{num_full_segments+1}"
-            chain_dict = {
-                'id': chain_id,
-                'sequence': sequence[start:end],
-                'description': f"segment_{num_full_segments+1}"
-            }
-            
-            split_name = f"{fold_input.name}_segment_{num_full_segments+1}"
-            split_input = folding_input.Input(
-                name=split_name,
-                chains=[chain_dict],
-                rng_seeds=fold_input.rng_seeds,
-            )
-            
-            split_inputs.append(split_input)
-    
-    return split_inputs
-
-def analyze_and_split_inputs(
-    fold_inputs: List[folding_input.Input],
-    segment_size: int = 50,  # 每片50个氨基酸
-    min_segment_size: int = 10  # 最小片段大小
-) -> Tuple[List[List[folding_input.Input]], Dict]:
-    """分析并分割输入文件的序列"""
-    
-    print("\n分析输入文件...")
-    all_split_inputs = []
-    
-    for fold_input in fold_inputs:
-        # 分割每个输入的序列
-        split_inputs = split_sequence(
-            fold_input, 
-            segment_size=segment_size,
-            min_segment_size=min_segment_size
-        )
-        all_split_inputs.extend(split_inputs)
-        
-        total_length = sum(len(chain.sequence) for chain in fold_input.chains)
-        print(f"\n原始输入 {fold_input.name}:")
-        print(f"序列长度: {total_length}")
-        print(f"分割数量: {len(split_inputs)}")
-        for i, split in enumerate(split_inputs):
-            split_length = sum(len(chain.sequence) for chain in split.chains)
-            print(f"分片 {i+1}: 长度={split_length}, 名称={split.name}")
-    
-    # 计算统计信息
-    stats = {
-        "total_inputs": len(fold_inputs),
-        "total_splits": len(all_split_inputs),
-        "segment_size": segment_size,
-    }
-    
-    print("\n分割统计信息:")
-    print(f"原始输入数量: {stats['total_inputs']}")
-    print(f"分割后片段数量: {stats['total_splits']}")
-    print(f"目标片段大小: {stats['segment_size']}")
-    
-    # 将分割后的输入组织成块
-    chunks = [all_split_inputs]
-    
-    return chunks, stats
-
-def get_system_resources():
-    """获取系统资源使用情况"""
-    cpu_percent = psutil.cpu_percent(interval=1)
-    memory = psutil.virtual_memory()
-    return {
-        'cpu_percent': cpu_percent,
-        'memory_available': memory.available,
-        'memory_percent': memory.percent
-    }
-
-def process_chunk(
-    chunk_inputs: List[folding_input.Input],
-    data_pipeline_config: pipeline.DataPipelineConfig | None,
-    model_config: model.Model.Config | None,
-    model_dir: pathlib.Path | None,
-    output_dir: str,
-    buckets: Sequence[int],
-    conformer_max_iterations: int | None = None,
-) -> List[Tuple[str, Any]]:
-    """处理一个输入块"""
-    results = []
-    for fold_input in chunk_inputs:
-        chunk_output_dir = os.path.join(output_dir, 'temp', fold_input.sanitised_name())
-        result = process_fold_input(
-            fold_input=fold_input,
-            data_pipeline_config=data_pipeline_config,
-            model_config=model_config,
-            model_dir=model_dir,
-            output_dir=chunk_output_dir,
-            buckets=buckets,
-            conformer_max_iterations=conformer_max_iterations,
-        )
-        results.append((fold_input.sanitised_name(), result))
-    return results
-
 def main(_):
-    if _JAX_COMPILATION_CACHE_DIR.value is not None:
-        jax.config.update(
-            'jax_compilation_cache_dir', _JAX_COMPILATION_CACHE_DIR.value
-        )
+  if _JAX_COMPILATION_CACHE_DIR.value is not None:
+    jax.config.update(
+        'jax_compilation_cache_dir', _JAX_COMPILATION_CACHE_DIR.value
+    )
 
-    if _JSON_PATH.value is None == _INPUT_DIR.value is None:
-        raise ValueError(
-            'Exactly one of --json_path or --input_dir must be specified.'
-        )
+  if _JSON_PATH.value is None == _INPUT_DIR.value is None:
+    raise ValueError(
+        'Exactly one of --json_path or --input_dir must be specified.'
+    )
 
-    if not _RUN_INFERENCE.value and not _RUN_DATA_PIPELINE.value:
-        raise ValueError(
-            'At least one of --run_inference or --run_data_pipeline must be'
-            ' set to true.'
-        )
+  if not _RUN_INFERENCE.value and not _RUN_DATA_PIPELINE.value:
+    raise ValueError(
+        'At least one of --run_inference or --run_data_pipeline must be'
+        ' set to true.'
+    )
 
-    if _INPUT_DIR.value is not None:
-        fold_inputs = folding_input.load_fold_inputs_from_dir(
-            pathlib.Path(_INPUT_DIR.value)
-        )
-    elif _JSON_PATH.value is not None:
-        fold_inputs = folding_input.load_fold_inputs_from_path(
-            pathlib.Path(_JSON_PATH.value)
-        )
-    else:
-        raise AssertionError(
-            'Exactly one of --json_path or --input_dir must be specified.'
-        )
+  if _INPUT_DIR.value is not None:
+    fold_inputs = folding_input.load_fold_inputs_from_dir(
+        pathlib.Path(_INPUT_DIR.value)
+    )
+  elif _JSON_PATH.value is not None:
+    fold_inputs = folding_input.load_fold_inputs_from_path(
+        pathlib.Path(_JSON_PATH.value)
+    )
+  else:
+    raise AssertionError(
+        'Exactly one of --json_path or --input_dir must be specified.'
+    )
 
-    # 处理NUM_SEEDS参数
+  # Make sure we can create the output directory before running anything.
+  try:
+    os.makedirs(_OUTPUT_DIR.value, exist_ok=True)
+  except OSError as e:
+    print(f'Failed to create output directory {_OUTPUT_DIR.value}: {e}')
+    raise
+
+  notice = textwrap.wrap(
+      'Running AlphaFold 3. Please note that standard AlphaFold 3 model'
+      ' parameters are only available under terms of use provided at'
+      ' https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md.'
+      ' If you do not agree to these terms and are using AlphaFold 3 derived'
+      ' model parameters, cancel execution of AlphaFold 3 inference with'
+      ' CTRL-C, and do not use the model parameters.',
+      break_long_words=False,
+      break_on_hyphens=False,
+      width=80,
+  )
+  print('\n' + '\n'.join(notice) + '\n')
+
+  if _RUN_DATA_PIPELINE.value:
+    expand_path = lambda x: replace_db_dir(x, DB_DIR.value)
+    max_template_date = datetime.date.fromisoformat(_MAX_TEMPLATE_DATE.value)
+    data_pipeline_config = pipeline.DataPipelineConfig(
+        jackhmmer_binary_path=_JACKHMMER_BINARY_PATH.value,
+        nhmmer_binary_path=_NHMMER_BINARY_PATH.value,
+        hmmalign_binary_path=_HMMALIGN_BINARY_PATH.value,
+        hmmsearch_binary_path=_HMMSEARCH_BINARY_PATH.value,
+        hmmbuild_binary_path=_HMMBUILD_BINARY_PATH.value,
+        small_bfd_database_path=expand_path(_SMALL_BFD_DATABASE_PATH.value),
+        mgnify_database_path=expand_path(_MGNIFY_DATABASE_PATH.value),
+        uniprot_cluster_annot_database_path=expand_path(
+            _UNIPROT_CLUSTER_ANNOT_DATABASE_PATH.value
+        ),
+        uniref90_database_path=expand_path(_UNIREF90_DATABASE_PATH.value),
+        ntrna_database_path=expand_path(_NTRNA_DATABASE_PATH.value),
+        rfam_database_path=expand_path(_RFAM_DATABASE_PATH.value),
+        rna_central_database_path=expand_path(_RNA_CENTRAL_DATABASE_PATH.value),
+        pdb_database_path=expand_path(_PDB_DATABASE_PATH.value),
+        seqres_database_path=expand_path(_SEQRES_DATABASE_PATH.value),
+        jackhmmer_n_cpu=_JACKHMMER_N_CPU.value,
+        nhmmer_n_cpu=_NHMMER_N_CPU.value,
+        max_template_date=max_template_date,
+    )
+  else:
+    data_pipeline_config = None
+
+  if _RUN_INFERENCE.value:
+    # 创建模型配置
+    model_config = make_model_config(
+        flash_attention_implementation='xla',  # CPU只支持XLA实现
+        num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
+        num_recycles=_NUM_RECYCLES.value,
+        return_embeddings=_SAVE_EMBEDDINGS.value,
+    )
+    model_dir = pathlib.Path(MODEL_DIR.value)
+    
+    # 检查模型参数是否可以加载
+    print('Checking that model parameters can be loaded...')
+    test_runner = create_model_runner(model_config, model_dir)
+    _ = test_runner._get_cached_params('')
+  else:
+    model_config = None
+    model_dir = None
+
+  num_fold_inputs = 0
+  for fold_input in fold_inputs:
     if _NUM_SEEDS.value is not None:
-        # 将生成器转换为列表并处理seeds
-        fold_inputs = [
-            input.with_multiple_seeds(_NUM_SEEDS.value) 
-            for input in fold_inputs
-        ]
-        print(f'Expanded inputs to use {_NUM_SEEDS.value} seeds each')
-    else:
-        # 仅将生成器转换为列表
-        fold_inputs = list(fold_inputs)
-
-    # Make sure we can create the output directory before running anything.
-    try:
-        os.makedirs(_OUTPUT_DIR.value, exist_ok=True)
-    except OSError as e:
-        print(f'Failed to create output directory {_OUTPUT_DIR.value}: {e}')
-        raise
-
-    notice = textwrap.wrap(
-        'Running AlphaFold 3. Please note that standard AlphaFold 3 model'
-        ' parameters are only available under terms of use provided at'
-        ' https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md.'
-        ' If you do not agree to these terms and are using AlphaFold 3 derived'
-        ' model parameters, cancel execution of AlphaFold 3 inference with'
-        ' CTRL-C, and do not use the model parameters.',
-        break_long_words=False,
-        break_on_hyphens=False,
-        width=80,
+      print(f'Expanding fold job {fold_input.name} to {_NUM_SEEDS.value} seeds')
+      fold_input = fold_input.with_multiple_seeds(_NUM_SEEDS.value)
+    process_fold_input(
+        fold_input=fold_input,
+        data_pipeline_config=data_pipeline_config,
+        model_config=model_config,
+        model_dir=model_dir,
+        output_dir=os.path.join(_OUTPUT_DIR.value, fold_input.sanitised_name()),
+        buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
+        conformer_max_iterations=_CONFORMER_MAX_ITERATIONS.value,
     )
-    print('\n' + '\n'.join(notice) + '\n')
+    num_fold_inputs += 1
 
-    if _RUN_DATA_PIPELINE.value:
-        expand_path = lambda x: replace_db_dir(x, DB_DIR.value)
-        max_template_date = datetime.date.fromisoformat(_MAX_TEMPLATE_DATE.value)
-        data_pipeline_config = pipeline.DataPipelineConfig(
-            jackhmmer_binary_path=_JACKHMMER_BINARY_PATH.value,
-            nhmmer_binary_path=_NHMMER_BINARY_PATH.value,
-            hmmalign_binary_path=_HMMALIGN_BINARY_PATH.value,
-            hmmsearch_binary_path=_HMMSEARCH_BINARY_PATH.value,
-            hmmbuild_binary_path=_HMMBUILD_BINARY_PATH.value,
-            small_bfd_database_path=expand_path(_SMALL_BFD_DATABASE_PATH.value),
-            mgnify_database_path=expand_path(_MGNIFY_DATABASE_PATH.value),
-            uniprot_cluster_annot_database_path=expand_path(
-                _UNIPROT_CLUSTER_ANNOT_DATABASE_PATH.value
-            ),
-            uniref90_database_path=expand_path(_UNIREF90_DATABASE_PATH.value),
-            ntrna_database_path=expand_path(_NTRNA_DATABASE_PATH.value),
-            rfam_database_path=expand_path(_RFAM_DATABASE_PATH.value),
-            rna_central_database_path=expand_path(_RNA_CENTRAL_DATABASE_PATH.value),
-            pdb_database_path=expand_path(_PDB_DATABASE_PATH.value),
-            seqres_database_path=expand_path(_SEQRES_DATABASE_PATH.value),
-            jackhmmer_n_cpu=_JACKHMMER_N_CPU.value,
-            nhmmer_n_cpu=_NHMMER_N_CPU.value,
-            max_template_date=max_template_date,
-        )
-    else:
-        data_pipeline_config = None
-
-    if _RUN_INFERENCE.value:
-        # 创建模型配置
-        model_config = make_model_config(
-            flash_attention_implementation='xla',  # CPU只支持XLA实现
-            num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
-            num_recycles=_NUM_RECYCLES.value,
-            return_embeddings=_SAVE_EMBEDDINGS.value,
-        )
-        model_dir = pathlib.Path(MODEL_DIR.value)
-        
-        # 检查模型参数是否可以加载
-        print('Checking that model parameters can be loaded...')
-        test_runner = create_model_runner(model_config, model_dir)
-        _ = test_runner._get_cached_params('')
-    else:
-        model_config = None
-        model_dir = None
-
-    # 分割输入序列，每个片段50个氨基酸
-    chunks, stats = analyze_and_split_inputs(
-        fold_inputs=fold_inputs,
-        segment_size=50,  # 改为50
-        min_segment_size=10  # 最小片段大小
-    )
-    
-    print("\n是否继续处理? (y/n)")
-    response = input().strip().lower()
-    if response != 'y':
-        print("程序终止")
-        return
-    
-    # 创建临时目录
-    temp_dir = os.path.join(_OUTPUT_DIR.value, 'temp')
-    os.makedirs(temp_dir, exist_ok=True)
-
-    # 创建进程池
-    max_workers = min(len(chunks), multiprocessing.cpu_count() - 1)
-    active_processes = []
-    chunk_queue = list(enumerate(chunks))
-
-    while chunk_queue or active_processes:
-        # 检查系统资源
-        resources = get_system_resources()
-        
-        # 根据资源使用情况决定是否启动新进程
-        while (chunk_queue and 
-               len(active_processes) < max_workers and 
-               resources['cpu_percent'] < 90 and 
-               resources['memory_percent'] < 90):
-            
-            chunk_id, chunk = chunk_queue.pop(0)
-            
-            # 创建新进程
-            process = multiprocessing.Process(
-                target=process_chunk,
-                args=(
-                    chunk,
-                    data_pipeline_config,
-                    model_config,
-                    model_dir,
-                    _OUTPUT_DIR.value,
-                    tuple(int(bucket) for bucket in _BUCKETS.value),
-                    _CONFORMER_MAX_ITERATIONS.value,
-                )
-            )
-            process.start()
-            active_processes.append((chunk_id, process))
-            print(f"Started processing chunk {chunk_id} with {len(chunk)} inputs")
-
-        # 检查完成的进程
-        still_active = []
-        for chunk_id, process in active_processes:
-            if not process.is_alive():
-                process.join()
-                print(f"Completed chunk {chunk_id}")
-                still_active.append((chunk_id, process))
-        
-        active_processes = [p for p in active_processes if p not in still_active]
-        
-        # 短暂休眠以避免过度检查
-        time.sleep(5)
-
-    print(f'Done running {len(fold_inputs)} fold jobs.')
+  print(f'Done running {num_fold_inputs} fold jobs.')
 
 
 if __name__ == '__main__':
-    flags.mark_flags_as_required(['output_dir'])
-    app.run(main)
+  flags.mark_flags_as_required(['output_dir'])
+  app.run(main)
