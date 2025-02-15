@@ -606,18 +606,35 @@ class ModelRunner:
         model_dir: pathlib.Path,
     ):
         self._model_config = config
-        self._devices = jax.local_devices(backend='cpu')[:2]  # 使用前两个CPU
-        print(f"Using CPU devices: {self._devices}")
-        self._device = device
         self._model_dir = model_dir
+        
+        # CPU设备检测和配置
+        all_devices = jax.local_devices(backend='cpu')
+        print(f"Available CPU devices: {all_devices}")
+        
+        # 确定要使用的CPU数量
+        num_physical_cores = psutil.cpu_count(logical=False)
+        if num_physical_cores >= 2:
+            self._devices = all_devices[:2]  # 使用两个CPU
+            threads_per_cpu = max(1, num_physical_cores // 2)
+        else:
+            self._devices = [device]  # 只使用一个CPU
+            threads_per_cpu = num_physical_cores
+            
+        print(f"Using CPU devices: {self._devices}")
+        self._device = self._devices[0]  # 主设备
+        
+        # 初始化管理器
         self._cache_manager = CacheManager()
         self._param_cache = {}
         self._numerics_handler = NumericsHandler()
         self._memory_manager = MemoryManager()
         
-        # CPU优化设置
-        num_physical_cores = psutil.cpu_count(logical=False)
-        threads_per_cpu = max(1, num_physical_cores // 2)  # 每个CPU使用一半的物理核心
+        # CPU线程配置
+        total_threads = threads_per_cpu * len(self._devices)
+        print(f"Physical cores: {num_physical_cores}")
+        print(f"Threads per CPU: {threads_per_cpu}")
+        print(f"Total threads: {total_threads}")
         
         # 设置线程数
         os.environ['OMP_NUM_THREADS'] = str(threads_per_cpu)
@@ -627,10 +644,11 @@ class ModelRunner:
         os.environ['NUMEXPR_NUM_THREADS'] = str(threads_per_cpu)
         
         # 设置CPU亲和性
-        os.environ['OMP_PLACES'] = 'cores'
-        os.environ['OMP_PROC_BIND'] = 'close'
-        
-        print(f"Threads per CPU: {threads_per_cpu}")
+        if len(self._devices) > 1:
+            os.environ['OMP_PLACES'] = 'cores'
+            os.environ['OMP_PROC_BIND'] = 'close'
+            # 设置NUMA策略
+            os.environ['KMP_AFFINITY'] = 'granularity=fine,compact,1,0'
         
         # JAX优化选项
         jax.config.update('jax_enable_x64', False)
