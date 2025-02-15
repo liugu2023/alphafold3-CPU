@@ -1046,7 +1046,7 @@ def process_chunk(
 
 def analyze_and_split_inputs(
     fold_inputs: List[folding_input.Input],
-    chunk_size: int = 5  # 每个分片包含的输入文件数量
+    chunk_size: int = 50  # 修改为50个输入文件为一片
 ) -> Tuple[List[List[folding_input.Input]], Dict]:
     """分析并分割输入文件"""
     
@@ -1075,7 +1075,7 @@ def analyze_and_split_inputs(
     print(f"最长序列长度: {stats['max_length']}")
     print(f"序列长度标准差: {stats['std_length']:.2f}")
     
-    # 分割输入
+    # 分割输入，每片50个
     chunks = [fold_inputs[i:i + chunk_size] for i in range(0, len(fold_inputs), chunk_size)]
     
     print(f"\n分割结果:")
@@ -1195,10 +1195,10 @@ def main(_):
         model_config = None
         model_dir = None
 
-    # 分割输入文件
+    # 分割输入文件，使用50个输入为一片
     chunks, stats = analyze_and_split_inputs(
         fold_inputs=fold_inputs,
-        chunk_size=5  # 每个分片5个输入文件
+        chunk_size=50  # 修改为50
     )
     
     print("\n是否继续处理? (y/n)")
