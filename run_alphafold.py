@@ -490,6 +490,64 @@ class NumericsHandler:
         return process_dict(result, parent_key)
 
 
+class MemoryManager:
+    """内存使用管理和监控"""
+    def __init__(self):
+        self.peak_memory = 0
+        self.current_memory = 0
+        self.memory_history = []
+        self.warnings_issued = set()
+    
+    def get_memory_usage(self) -> float:
+        """获取当前内存使用情况(MB)"""
+        process = psutil.Process()
+        memory = process.memory_info().rss / (1024 * 1024)  # 转换为MB
+        return memory
+    
+    def update(self) -> None:
+        """更新内存使用统计"""
+        self.current_memory = self.get_memory_usage()
+        self.peak_memory = max(self.peak_memory, self.current_memory)
+        self.memory_history.append(self.current_memory)
+        
+        # 检查内存使用是否超过阈值
+        available = psutil.virtual_memory().available / (1024 * 1024)
+        if available < 1000 and 'low_memory' not in self.warnings_issued:  # 小于1GB时警告
+            print(f"Warning: Low memory available: {available:.0f}MB")
+            self.warnings_issued.add('low_memory')
+    
+    def cleanup(self) -> None:
+        """主动清理内存"""
+        gc.collect()
+        
+        if hasattr(jax, 'clear_caches'):  # 清理JAX缓存
+            jax.clear_caches()
+    
+    def get_stats(self) -> Dict[str, float]:
+        """获取内存使用统计"""
+        return {
+            'peak_memory_mb': self.peak_memory,
+            'current_memory_mb': self.current_memory,
+            'average_memory_mb': np.mean(self.memory_history) if self.memory_history else 0,
+            'available_memory_mb': psutil.virtual_memory().available / (1024 * 1024)
+        }
+    
+    @contextmanager
+    def monitor(self, operation_name: str):
+        """监控特定操作的内存使用"""
+        start_memory = self.get_memory_usage()
+        self.update()
+        try:
+            yield
+        finally:
+            end_memory = self.get_memory_usage()
+            print(f"\nMemory usage for {operation_name}:")
+            print(f"  Start: {start_memory:.1f}MB")
+            print(f"  End: {end_memory:.1f}MB")
+            print(f"  Diff: {end_memory - start_memory:.1f}MB")
+            self.update()
+
+
 class ModelRunner:
     """添加缓存机制的ModelRunner"""
     def __init__(
@@ -504,9 +562,10 @@ class ModelRunner:
         self._cache_manager = CacheManager()
         self._param_cache = {}
         self._numerics_handler = NumericsHandler()
+        self._memory_manager = MemoryManager()
         
         # 设置JAX优化选项
-        jax.config.update('jax_enable_x64', False)  # 使用float32
+        jax.config.update('jax_enable_x64', False)
         jax.config.update('jax_default_matmul_precision', 'bfloat16')
     
     @functools.lru_cache(maxsize=32)
@@ -535,57 +594,65 @@ class ModelRunner:
         featurised_example: features.BatchDict,
         rng_key: jnp.ndarray,
     ) -> model.ModelResult:
-        """运行推理，添加数值检查"""
-        cache_key = self._cache_manager._get_cache_key(
-            featurised_example,
-            rng_key,
-            self._model_config
-        )
-        
-        # 检查缓存
-        cached_result = self._cache_manager.get(cache_key)
-        if cached_result is not None:
-            print("Using cached result")
-            return cached_result
-        
-        # 计算新结果
-        featurised_example = jax.device_put(
-            jax.tree_util.tree_map(
-                jnp.asarray, utils.remove_invalidly_typed_feats(featurised_example)
-            ),
-            self._device,
-        )
-
-        result = self._model(rng_key, featurised_example)
-        
-        # 检查并修复数值问题
-        result = self._numerics_handler.check_output_numerics(result)
-        
-        # 转换数据类型
-        result = jax.tree.map(np.asarray, result)
-        result = jax.tree.map(
-            lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x,
-            result,
-        )
-        
-        # 添加标识符
-        result = dict(result)
-        identifier = self._get_cached_params('')['__meta__']['__identifier__'].tobytes()
-        result['__identifier__'] = identifier
-        
-        # 最后检查关键坐标数据
-        if 'structure_module' in result:
-            for key in ['final_atom_positions', 'final_atom_mask']:
-                if key in result['structure_module']:
-                    result['structure_module'][key] = self._numerics_handler.fix_numerics(
-                        result['structure_module'][key],
-                        f'structure_module.{key}'
-                    )
-        
-        # 缓存结果
-        self._cache_manager.put(cache_key, result)
-        
-        return result
+        """运行推理，添加内存监控"""
+        with self._memory_manager.monitor("Model Inference"):
+            # 检查缓存
+            cache_key = self._cache_manager._get_cache_key(
+                featurised_example,
+                rng_key,
+                self._model_config
+            )
+            
+            cached_result = self._cache_manager.get(cache_key)
+            if cached_result is not None:
+                print("Using cached result")
+                return cached_result
+            
+            # 主动清理内存
+            self._memory_manager.cleanup()
+            
+            # 计算新结果
+            featurised_example = jax.device_put(
+                jax.tree_util.tree_map(
+                    jnp.asarray,
+                    utils.remove_invalidly_typed_feats(featurised_example)
+                ),
+                self._device,
+            )
+            
+            result = self._model(rng_key, featurised_example)
+            
+            # 检查并修复数值问题
+            result = self._numerics_handler.check_output_numerics(result)
+            
+            # 转换数据类型
+            result = jax.tree.map(np.asarray, result)
+            result = jax.tree.map(
+                lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x,
+                result,
+            )
+            
+            # 添加标识符
+            result = dict(result)
+            identifier = self._get_cached_params('')['__meta__']['__identifier__'].tobytes()
+            result['__identifier__'] = identifier
+            
+            # 最后检查关键坐标数据
+            if 'structure_module' in result:
+                for key in ['final_atom_positions', 'final_atom_mask']:
+                    if key in result['structure_module']:
+                        result['structure_module'][key] = self._numerics_handler.fix_numerics(
+                            result['structure_module'][key],
+                            f'structure_module.{key}'
+                        )
+            
+            # 缓存结果前清理内存
+            self._memory_manager.cleanup()
+            
+            # 缓存结果
+            self._cache_manager.put(cache_key, result)
+            
+            return result
 
     def extract_structures(
         self,
