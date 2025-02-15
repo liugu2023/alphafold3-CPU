@@ -19,6 +19,16 @@ if received directly from Google. Use is subject to terms of use available at
 https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md
 """
 
+# 在所有导入语句之前设置环境变量
+import os
+# 禁用ROCM和TPU检查
+os.environ['JAX_PLATFORMS'] = 'cpu'  # 强制使用CPU平台
+os.environ['JAX_SKIP_ROCM_TESTS'] = '1'  # 跳过ROCM测试
+os.environ['JAX_SKIP_TPU_TESTS'] = '1'   # 跳过TPU测试
+# 禁用JAX日志
+os.environ['JAX_LOG_COMPILES'] = '0'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # 禁用TensorFlow日志
+
 from collections.abc import Callable, Sequence
 import csv
 import dataclasses
@@ -570,11 +580,6 @@ def create_model_runner(model_config, model_dir):
     # 设置JAX优化选项
     jax.config.update('jax_enable_x64', False)  # 使用float32以提高性能
     jax.config.update('jax_default_matmul_precision', 'bfloat16')  # 使用bfloat16加速矩阵运算
-    
-    # 禁用ROCM和TPU检查
-    os.environ['JAX_PLATFORMS'] = 'cpu'  # 强制使用CPU平台
-    os.environ['JAX_SKIP_ROCM_TESTS'] = '1'  # 跳过ROCM测试
-    os.environ['JAX_SKIP_TPU_TESTS'] = '1'   # 跳过TPU测试
     
     # 设置CPU线程数
     num_physical_cores = psutil.cpu_count(logical=False)  # 物理核心数
