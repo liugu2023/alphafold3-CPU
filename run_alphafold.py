@@ -19,7 +19,7 @@ if received directly from Google. Use is subject to terms of use available at
 https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md
 """
 
-from collections.abc import Callable, Sequence, List, Tuple, Any
+from collections.abc import Callable, Sequence
 import csv
 import dataclasses
 import datetime
@@ -32,7 +32,7 @@ import string
 import textwrap
 import time
 import typing
-from typing import overload
+from typing import overload, Dict, Any, Tuple, Optional, List
 from concurrent.futures import ProcessPoolExecutor
 import psutil
 import gc
