@@ -1025,18 +1025,15 @@ def split_sequence(fold_input: folding_input.Input, segment_size: int = 50, min_
             start = i * segment_size
             end = (i + 1) * segment_size
             
-            # 创建新的chain
-            new_chain = folding_input.Chain(
-                sequence=sequence[start:end],
-                name=chain.name,
-                description=f"{chain.description}_segment_{i+1}" if chain.description else f"segment_{i+1}"
-            )
-            
-            # 创建新的fold_input
+            # 创建新的fold_input，直接使用字典构造
             split_name = f"{fold_input.name}_segment_{i+1}"
             split_input = folding_input.Input(
                 name=split_name,
-                chains=[new_chain],
+                chains=[{
+                    'sequence': sequence[start:end],
+                    'name': chain.name,
+                    'description': f"{chain.description}_segment_{i+1}" if chain.description else f"segment_{i+1}"
+                }],
                 rng_seeds=fold_input.rng_seeds,
                 max_recycles=fold_input.max_recycles,
                 user_ccd=fold_input.user_ccd
@@ -1049,16 +1046,14 @@ def split_sequence(fold_input: folding_input.Input, segment_size: int = 50, min_
             start = num_full_segments * segment_size
             end = len(sequence)
             
-            new_chain = folding_input.Chain(
-                sequence=sequence[start:end],
-                name=chain.name,
-                description=f"{chain.description}_segment_{num_full_segments+1}" if chain.description else f"segment_{num_full_segments+1}"
-            )
-            
             split_name = f"{fold_input.name}_segment_{num_full_segments+1}"
             split_input = folding_input.Input(
                 name=split_name,
-                chains=[new_chain],
+                chains=[{
+                    'sequence': sequence[start:end],
+                    'name': chain.name,
+                    'description': f"{chain.description}_segment_{num_full_segments+1}" if chain.description else f"segment_{num_full_segments+1}"
+                }],
                 rng_seeds=fold_input.rng_seeds,
                 max_recycles=fold_input.max_recycles,
                 user_ccd=fold_input.user_ccd
