@@ -1056,7 +1056,9 @@ def process_fold_input(
 
 def split_fold_inputs(fold_inputs: Sequence[folding_input.Input], chunk_size: int = 40) -> List[List[folding_input.Input]]:
     """将输入分割成固定大小的块"""
-    return [fold_inputs[i:i + chunk_size] for i in range(0, len(fold_inputs), chunk_size)]
+    # 将生成器转换为列表
+    inputs_list = list(fold_inputs)
+    return [inputs_list[i:i + chunk_size] for i in range(0, len(inputs_list), chunk_size)]
 
 def get_system_resources():
     """获取系统资源使用情况"""
@@ -1142,6 +1144,18 @@ def main(_):
         raise AssertionError(
             'Exactly one of --json_path or --input_dir must be specified.'
         )
+
+    # 处理NUM_SEEDS参数
+    if _NUM_SEEDS.value is not None:
+        # 将生成器转换为列表并处理seeds
+        fold_inputs = [
+            input.with_multiple_seeds(_NUM_SEEDS.value) 
+            for input in fold_inputs
+        ]
+        print(f'Expanded inputs to use {_NUM_SEEDS.value} seeds each')
+    else:
+        # 仅将生成器转换为列表
+        fold_inputs = list(fold_inputs)
 
     # Make sure we can create the output directory before running anything.
     try:
